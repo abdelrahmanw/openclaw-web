@@ -28,6 +28,10 @@ A Claude.ai-style web chat interface for your [OpenClaw](https://openclaw.ai) ag
 
 ## Quick setup
 
+**Just want to send this to your agent?** Copy the message from [SETUP_PROMPT.md](SETUP_PROMPT.md) and paste it to them. They'll handle the rest.
+
+Or run it yourself:
+
 ```bash
 git clone https://github.com/abdelrahmanw/openclaw-web.git
 cd openclaw-web
