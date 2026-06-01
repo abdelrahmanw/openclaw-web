@@ -1,0 +1,21 @@
+{
+  "name": "openclaw-web",
+  "version": "1.0.0",
+  "description": "Claude.ai-style web UI for your OpenClaw agent",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "connect-sqlite3": "^0.9.14",
+    "express": "^4.18.3",
+    "express-session": "^1.18.0",
+    "multer": "^1.4.5-lts.1",
+    "openai": "^4.47.1",
+    "sql.js": "^1.14.1",
+    "sqlite3": "^6.0.1",
+    "uuid": "^9.0.1",
+    "ws": "^8.20.1"
+  }
+}

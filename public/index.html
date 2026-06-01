@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>OpenClaw Web</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🤖%3C/text%3E%3C/svg%3E"/>
+  <link rel="stylesheet" href="/style.css"/>
+  <link rel="stylesheet" id="hljs-dark" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css"/>
+  <link rel="stylesheet" id="hljs-light" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" disabled/>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/11.1.1/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body>
+
+<!-- Login -->
+<div id="login-screen" style="display:none">
+  <div class="login-card">
+    <div class="login-logo">OpenClaw Web</div>
+    <input type="password" class="login-input" id="login-pw" placeholder="Password" autofocus/>
+    <button class="login-btn" onclick="doLogin()">Sign in</button>
+    <div class="login-error" id="login-error" style="display:none"></div>
+  </div>
+</div>
+
+<!-- App -->
+<div id="app" style="display:none">
+  <!-- Sidebar -->
+  <div id="sidebar">
+    <div class="sidebar-header">
+      <div class="logo"><div class="logo-icon">🤖</div> My Agent</div>
+      <button class="new-chat-btn" onclick="newChat()">+ New Chat</button>
+      <input type="text" class="sidebar-search" placeholder="Search chats..." oninput="filterChats(this.value)" id="search-input"/>
+    </div>
+    <div class="sidebar-nav">
+      <button class="nav-tab active" onclick="showTab('chats',this)">Chats</button>
+      <button class="nav-tab" onclick="showTab('projects',this)">Projects</button>
+    </div>
+    <div class="sidebar-content" id="sidebar-content"></div>
+  </div>
+
+  <!-- Main -->
+  <div id="main">
+    <div class="main-header">
+      <div class="chat-title-display" id="chat-title">Select or start a chat</div>
+      <div class="header-actions" id="header-actions" style="display:none">
+        <button class="header-btn" onclick="showShareModal()">Share</button>
+        <button class="header-btn" onclick="toggleArtifactPanel()">Artifacts</button>
+      </div>
+      <button class="header-btn" id="rename-all-btn" onclick="renameAllChats()" title="AI-rename all chats based on their content">✨ Rename All</button>
+      <button class="header-btn" onclick="toggleTheme()" id="theme-toggle-btn" title="Toggle light/dark mode">☀️</button>
+      <button class="header-btn skills-always-btn" onclick="toggleWorkflowsPanel()" id="workflows-toggle-btn">Workflows</button>
+      <button class="header-btn skills-always-btn" onclick="toggleSkillsPanel()" id="skills-toggle-btn">Skills</button>
+    </div>
+    <div id="messages-area">
+      <div class="empty-state" id="empty-state">
+        <div class="empty-state-icon">🤖</div>
+        <div class="empty-state-text">Start a new chat or select one from the sidebar</div>
+      </div>
+    </div>
+    <div id="input-area" style="display:none">
+      <div class="input-wrap">
+        <div class="input-attachments" id="input-attachments"></div>
+        <div class="input-row" id="input-row">
+          <textarea id="msg-input" placeholder="Message your agent..." rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+          <input type="file" id="file-input" multiple style="display:none" onchange="handleFiles(this.files)"/>
+          <button class="input-btn" onclick="document.getElementById('file-input').click()" title="Attach file">📎</button>
+          <button class="input-btn record" id="record-btn" onclick="toggleRecord()" title="Voice message">🎤</button>
+          <button class="stop-btn" id="stop-btn" onclick="stopGeneration()" title="Stop generation" style="display:none">⏹ Stop</button>
+          <button class="send-btn" id="send-btn" onclick="sendMessage()">Send</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Artifact panel (inside #app so it participates in flex layout) -->
+  <div id="artifact-panel">
+    <div class="artifact-header">
+      <div class="artifact-title" id="artifact-title">Artifact</div>
+      <button class="artifact-close" onclick="closeArtifactPanel()">✕</button>
+    </div>
+    <div class="artifact-tabs" id="artifact-tabs"></div>
+    <div class="artifact-body" id="artifact-body"></div>
+    <div class="artifact-actions">
+      <button class="artifact-action-btn" onclick="copyArtifact()">Copy</button>
+      <button class="artifact-action-btn primary" onclick="downloadArtifact()">Download</button>
+    </div>
+  </div>
+  <!-- Workflows Panel (inside #app so it compresses chat on open) -->
+  <div id="workflows-panel">
+  <div class="skills-header">
+    <div class="skills-title">Workflows</div>
+    <button class="artifact-close" onclick="toggleWorkflowsPanel()">✕</button>
+  </div>
+  <div class="skills-search-wrap">
+    <input type="text" class="skills-search" id="workflows-search" placeholder="Search workflows..." oninput="filterWorkflows(this.value)"/>
+  </div>
+  <div class="skills-list" id="workflows-list"><div class="skills-loading">Loading...</div></div>
+  <div id="workflows-viewer" style="display:none">
+    <div class="skills-viewer-header">
+      <button class="skills-back-btn" onclick="closeWorkflowViewer()">← Back</button>
+      <div class="skills-viewer-name" id="workflows-viewer-name"></div>
+    </div>
+    <div class="skills-viewer-body" id="workflows-viewer-body"></div>
+  </div>
+  </div>
+
+  <!-- Skills Panel (inside #app so it compresses chat on open) -->
+  <div id="skills-panel">
+  <div class="skills-header">
+    <div class="skills-title">Skills</div>
+    <button class="artifact-close" onclick="toggleSkillsPanel()">✕</button>
+  </div>
+  <div class="skills-search-wrap">
+    <input type="text" class="skills-search" id="skills-search" placeholder="Search skills..." oninput="filterSkills(this.value)"/>
+  </div>
+  <div class="skills-list" id="skills-list"><div class="skills-loading">Loading...</div></div>
+  <div id="skills-viewer" style="display:none">
+    <div class="skills-viewer-header">
+      <button class="skills-back-btn" onclick="closeSkillViewer()">← Back</button>
+      <div class="skills-viewer-name" id="skills-viewer-name"></div>
+    </div>
+    <div class="skills-viewer-body" id="skills-viewer-body"></div>
+  </div>
+  </div>
+
+</div>
+
+<!-- Modals -->
+<div id="modal-overlay" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeModal()">
+  <div class="modal" id="modal-content"></div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

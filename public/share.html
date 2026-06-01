@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Shared Chat</title>
+  <link rel="stylesheet" href="/style.css"/>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/11.1.1/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css"/>
+</head>
+<body style="overflow:auto;display:block">
+<div class="share-container">
+  <div class="share-header">
+    <div class="logo" style="margin-bottom:16px"><span style="color:var(--accent)">Shared Chat</span></div>
+    <div id="chat-title" style="font-size:20px;font-weight:600;margin-bottom:4px"></div>
+    <div id="chat-meta" style="font-size:13px;color:var(--text-muted)"></div>
+  </div>
+  <div id="pw-prompt" style="display:none">
+    <div style="display:flex;gap:8px;margin-bottom:20px">
+      <input type="password" id="share-pw" class="modal-input" placeholder="Enter password" style="flex:1"/>
+      <button class="modal-btn primary" onclick="loadShare()">Unlock</button>
+    </div>
+  </div>
+  <div id="messages-container" style="display:flex;flex-direction:column;gap:16px"></div>
+</div>
+<script>
+const token = location.pathname.split('/share/')[1];
+let sharedPw = '';
+
+async function loadShare() {
+  const pw = document.getElementById('share-pw')?.value || sharedPw;
+  const url = `/api/share/${token}${pw ? `?password=${encodeURIComponent(pw)}` : ''}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (res.status === 401 && data.protected) {
+    document.getElementById('pw-prompt').style.display = 'block';
+    return;
+  }
+  if (!res.ok) { document.getElementById('messages-container').innerHTML = `<p style="color:var(--danger)">${data.error}</p>`; return; }
+  document.getElementById('pw-prompt').style.display = 'none';
+  document.getElementById('chat-title').textContent = data.chat.title;
+  document.getElementById('chat-meta').textContent = `${data.messages.length} messages`;
+  renderMessages(data.messages);
+}
+
+function renderMessages(msgs) {
+  const c = document.getElementById('messages-container');
+  c.innerHTML = msgs.map(m => {
+    const content = m.role === 'user' ? esc(m.content).replace(/\n/g,'<br>') : marked.parse(m.content);
+    return `<div class="message ${m.role}">
+      <div class="message-avatar">${m.role === 'user' ? 'A' : '🤖'}</div>
+      <div class="message-content"><div class="message-bubble">${content}</div></div>
+    </div>`;
+  }).join('');
+}
+
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+loadShare();
+</script>
+</body>
+</html>
