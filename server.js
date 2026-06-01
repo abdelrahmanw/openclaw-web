@@ -8,8 +8,8 @@ const path = require('path');
 const fs = require('fs');
 const https = require('https');
 const http = require('http');
-const { exec, execFile } = require('child_process');
-// Track active agent child processes for abort: { chatId: { child, aiMsgId } }
+const { exec } = require('child_process');
+// Track active agent processes for abort: { chatId: { abortController, aiMsgId } }
 const activeAgentProcesses = {};
 
 // Per-chat message queue — holds messages that arrive while the agent is busy
@@ -342,7 +342,46 @@ app.post('/api/chats/:id/send', upload.array('files'), async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-const OPENCLAW_BIN = '/usr/bin/openclaw';
+// In-process agent runner — we directly import agentCommand instead of
+// going through the CLI path, which avoids stdout/stderr capture issues
+let agentCommandFn = null;
+let agentCommandReady = null;
+function initAgentCommand() {
+  if (agentCommandReady) return agentCommandReady;
+  agentCommandReady = (async () => {
+    try {
+      // Intercept stdout during module load to suppress plugin registration messages
+      const origWrite = process.stdout.write.bind(process.stdout);
+      process.stdout.write = (chunk, encoding, cb) => { return true; };
+      try {
+        const oc = await import('/data/.npm-global/lib/node_modules/openclaw/dist/agent-command-QBBzz2Au.js');
+        agentCommandFn = oc.t;
+        const runtimeMod = await import('/data/.npm-global/lib/node_modules/openclaw/dist/runtime-yzlkhCoS.js');
+        const depsMod = await import('/data/.npm-global/lib/node_modules/openclaw/dist/deps-DynEVk0q.js');
+        // Use createNonExitingRuntime so process.exit() doesn't kill the server
+        const safeRuntime = runtimeMod.t ? runtimeMod.t() : runtimeMod.createNonExitingRuntime();
+        const defaultRuntime = runtimeMod.n || runtimeMod.defaultRuntime;
+        return { agentCommand: agentCommandFn, runtime: safeRuntime, defaultRuntime, deps: depsMod };
+      } finally {
+        process.stdout.write = origWrite;
+      }
+    } catch (e) {
+      console.error('[agent-command] init failed:', e.message);
+      agentCommandReady = null;
+      throw e;
+    }
+  })();
+  return agentCommandReady;
+}
+
+// Pre-warm at startup
+setTimeout(() => {
+  initAgentCommand().then(() => {
+    console.log('[agent-command] Pre-warmed in-process agent command');
+  }).catch(e => {
+    console.error('[agent-command] Pre-warm failed:', e.message);
+  });
+}, 100);
 
 async function runAgent(chat, userMessage, attachments, aiMsgId) {
   try {
@@ -377,49 +416,66 @@ async function runAgent(chat, userMessage, attachments, aiMsgId) {
     // Derive session key: use chat's telegram_session_key if set, otherwise use chat id
     const sessionKey = chat.telegram_session_key || `web-${chat.id}`;
 
-    // Run the real OpenClaw agent via CLI — same session store as Telegram
+    // Run the OpenClaw agent in-process via agentCommand (returns result directly)
     const reply = await new Promise((resolve, reject) => {
-      const args = [
-        'agent',
-        '--session-id', sessionKey,
-        '--message', fullMessage,
-        '--json'
-      ];
+      const abortController = new AbortController();
+      activeAgentProcesses[chat.id] = { abortController, aiMsgId };
 
-      // Load env from ~/.openclaw/.env
-      const envLines = (() => {
-        try { return fs.readFileSync(path.join(process.env.HOME || '/home/clawdbot', '.openclaw', '.env'), 'utf8').split('\n'); }
-        catch { return []; }
-      })();
-      const extraEnv = {};
-      for (const line of envLines) {
-        const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
-        if (m) extraEnv[m[1]] = m[2].replace(/^["']|["']$/g, '');
-      }
+      let done = false;
+      const cleanup = () => {
+        if (done) return;
+        done = true;
+        delete activeAgentProcesses[chat.id];
+      };
 
-      const child = execFile(OPENCLAW_BIN, args, {
-        timeout: 300000, // 5 min
-        maxBuffer: 10 * 1024 * 1024,
-        env: { ...process.env, ...extraEnv }
-      }, (err, stdout, stderr) => {
-        delete activeAgentProcesses[chat.id]; // clean up when done
-        if (err && !stdout) return reject(new Error(err.message + (stderr ? '\n' + stderr.slice(0, 500) : '')));
-        // Parse JSON output
-        try {
-          // stdout may have config warnings before JSON
-          const jsonStart = stdout.indexOf('{');
-          if (jsonStart < 0) return reject(new Error('No JSON in agent output: ' + stdout.slice(0, 300)));
-          const result = JSON.parse(stdout.slice(jsonStart));
-          if (result.status !== 'ok') return reject(new Error('Agent status: ' + result.status));
-          const texts = (result.result?.payloads || []).map(p => p.text).filter(Boolean);
-          resolve(texts.join('\n\n') || 'Done.');
-        } catch (parseErr) {
-          // Fallback: return raw stdout stripped of config warnings
-          const clean = stdout.replace(/^Config warnings:[\s\S]*?\n\n/m, '').trim();
-          resolve(clean || 'Done.');
-        }
+      // Safety timeout
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('Agent execution timed out after 5 minutes'));
+      }, 300000);
+
+      // Allow abort
+      abortController.signal.addEventListener('abort', () => {
+        cleanup();
+        reject(new Error('Agent execution aborted'));
+        clearTimeout(timer);
       });
-      activeAgentProcesses[chat.id] = { child, aiMsgId };
+
+      (agentCommandReady || initAgentCommand()).then(async (modules) => {
+        try {
+          const acFn = modules.agentCommand;
+          const runtime = modules.runtime;
+          const deps = modules.deps;
+          
+          const result = await acFn({
+            message: fullMessage,
+            sessionKey: sessionKey,
+            senderIsOwner: true,
+            allowModelOverride: true,
+            abortSignal: abortController.signal
+          }, runtime, deps);
+          
+          clearTimeout(timer);
+          cleanup();
+          
+          // Parse the response — result is deliveryResult with payloads at top level
+          const payloads = result?.payloads || [];
+          if (payloads.length === 0) {
+            resolve(result?.meta?.summary || 'Done.');
+          } else {
+            const texts = payloads.map(p => p.text).filter(Boolean);
+            resolve(texts.join('\n\n') || 'Done.');
+          }
+        } catch (runnerErr) {
+          clearTimeout(timer);
+          cleanup();
+          reject(new Error('Agent error: ' + runnerErr.message));
+        }
+      }).catch((initErr) => {
+        clearTimeout(timer);
+        cleanup();
+        reject(new Error('Agent init failed: ' + initErr.message));
+      });
     });
 
     await db.run_('UPDATE messages SET content = ? WHERE id = ?', [reply, aiMsgId]);
@@ -706,8 +762,7 @@ app.post('/api/chats/:id/abort', requireAuth, async (req, res) => {
   const proc = activeAgentProcesses[chatId];
   if (proc) {
     try {
-      proc.child.kill('SIGTERM');
-      setTimeout(() => { try { proc.child.kill('SIGKILL'); } catch {} }, 2000);
+      proc.abortController.abort();
     } catch {}
     delete activeAgentProcesses[chatId];
     if (proc.aiMsgId) {
