@@ -120,6 +120,15 @@ app.post('/api/login', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+app.get('/api/app-config', (req, res) => {
+  const envLines = (() => { try { return fs.readFileSync(path.join(process.env.HOME || '/home/clawdbot', '.openclaw', '.env'), 'utf8').split('
+'); } catch { return []; } })();
+  const extraEnv = {};
+  for (const line of envLines) { const m = line.match(/^([A-Z0-9_]+)=(.*)$/); if (m) extraEnv[m[1]] = m[2].trim(); }
+  const instanceName = extraEnv.INSTANCE_NAME || process.env.INSTANCE_NAME || 'My Agent';
+  res.json({ instanceName });
+});
+
 app.post('/api/logout', (req, res) => { req.session.destroy(); res.json({ ok: true }); });
 app.get('/api/me', (req, res) => res.json({ authenticated: !!req.session.authenticated }));
 
@@ -558,6 +567,55 @@ app.patch('/api/messages/:id', requireAuth, async (req, res) => {
   res.json({ ...msg, attachments: JSON.parse(msg.attachments || '[]') });
 });
 
+
+// --- Voice message: create placeholder rows (no agent call yet) ---
+app.post('/api/chats/:id/send-voice-init', requireAuth, async (req, res) => {
+  try {
+    const chat = await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]);
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    const now = Date.now();
+    const userMsgId = uuidv4();
+    const aiMsgId = uuidv4();
+    await db.run_(
+      'INSERT INTO messages (id, chat_id, role, content, attachments, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [userMsgId, chat.id, 'user', '🎤 Transcribing...', '[]', now]
+    );
+    await db.run_(
+      'INSERT INTO messages (id, chat_id, role, content, attachments, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [aiMsgId, chat.id, 'assistant', '...thinking...', '[]', now + 1]
+    );
+    await db.run_('UPDATE chats SET updated_at = ? WHERE id = ?', [now, chat.id]);
+    res.json({ userMsgId, aiMsgId });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Voice reply: transcript exists, placeholder created, just run agent ---
+app.post('/api/chats/:id/send-voice-reply', requireAuth, async (req, res) => {
+  try {
+    const chat = await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]);
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    const { transcript, aiMsgId, audioPath, audioFilename } = req.body;
+    if (!transcript || !aiMsgId) return res.status(400).json({ error: 'Missing transcript or aiMsgId' });
+
+    const attachments = [];
+    if (audioPath && fs.existsSync(audioPath)) {
+      attachments.push({ name: audioFilename || 'voice-message.webm', path: audioPath, mimetype: 'audio/webm', isVoice: true });
+    }
+
+    res.json({ ok: true });
+
+    if (chatGatewayBusy.has(chat.id)) {
+      enqueueMessage(chat, transcript, attachments, aiMsgId);
+    } else {
+      chatGatewayBusy.add(chat.id);
+      runAgent(chat, transcript, attachments, aiMsgId).finally(() => {
+        chatGatewayBusy.delete(chat.id);
+        drainQueue(chat.id);
+      });
+    }
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // --- Transcribe audio ---
 app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No audio file' });
@@ -573,6 +631,15 @@ app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
     });
     res.json({ text: transcription.text });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+// --- Serve uploaded audio files ---
+app.get('/api/audio/:filename', requireAuth, (req, res) => {
+  const filePath = require('path').join(UPLOAD_DIR, req.params.filename);
+  if (!require('fs').existsSync(filePath)) return res.status(404).json({ error: 'Audio not found' });
+  res.setHeader('Content-Type', 'audio/webm');
+  res.sendFile(filePath);
 });
 
 // --- Download file ---

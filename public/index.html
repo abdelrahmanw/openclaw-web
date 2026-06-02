@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>OpenClaw Web</title>
+  <title id="page-title">OpenClaw Web</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🤖%3C/text%3E%3C/svg%3E"/>
   <link rel="stylesheet" href="/style.css"/>
   <link rel="stylesheet" id="hljs-dark" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css"/>
@@ -16,7 +16,7 @@
 <!-- Login -->
 <div id="login-screen" style="display:none">
   <div class="login-card">
-    <div class="login-logo">OpenClaw Web</div>
+    <div class="login-logo"><span id="login-instance-name">My Agent</span></div>
     <input type="password" class="login-input" id="login-pw" placeholder="Password" autofocus/>
     <button class="login-btn" onclick="doLogin()">Sign in</button>
     <div class="login-error" id="login-error" style="display:none"></div>
@@ -28,7 +28,7 @@
   <!-- Sidebar -->
   <div id="sidebar">
     <div class="sidebar-header">
-      <div class="logo"><div class="logo-icon">🤖</div> My Agent</div>
+      <div class="logo"><div class="logo-icon">🤖</div> <span id="sidebar-instance-name">My Agent</span></div>
       <button class="new-chat-btn" onclick="newChat()">+ New Chat</button>
       <input type="text" class="sidebar-search" placeholder="Search chats..." oninput="filterChats(this.value)" id="search-input"/>
     </div>
@@ -66,6 +66,7 @@
           <input type="file" id="file-input" multiple style="display:none" onchange="handleFiles(this.files)"/>
           <button class="input-btn" onclick="document.getElementById('file-input').click()" title="Attach file">📎</button>
           <button class="input-btn record" id="record-btn" onclick="toggleRecord()" title="Voice message">🎤</button>
+          <button class="input-btn cancel-record" id="cancel-record-btn" onclick="cancelRecord()" title="Cancel recording" style="display:none">✕ Cancel</button>
           <button class="stop-btn" id="stop-btn" onclick="stopGeneration()" title="Stop generation" style="display:none">⏹ Stop</button>
           <button class="send-btn" id="send-btn" onclick="sendMessage()">Send</button>
         </div>

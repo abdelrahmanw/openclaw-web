@@ -1,6 +1,6 @@
 // === Theme (dark / light) ===
 function initTheme() {
-  const saved = localStorage.getItem('openclaw-web-theme');
+  const saved = localStorage.getItem('openclaw-theme');
   if (saved === 'light') applyTheme('light');
   else applyTheme('dark');
 }
@@ -15,13 +15,13 @@ function applyTheme(mode) {
     if (btn) btn.textContent = '🌙';
     if (hljsDark) hljsDark.disabled = true;
     if (hljsLight) hljsLight.disabled = false;
-    localStorage.setItem('openclaw-web-theme', 'light');
+    localStorage.setItem('openclaw-theme', 'light');
   } else {
     root.classList.remove('light');
     if (btn) btn.textContent = '☀️';
     if (hljsDark) hljsDark.disabled = false;
     if (hljsLight) hljsLight.disabled = true;
-    localStorage.setItem('openclaw-web-theme', 'dark');
+    localStorage.setItem('openclaw-theme', 'dark');
   }
 }
 
@@ -115,6 +115,17 @@ let state = {
 // === Init ===
 window.addEventListener('DOMContentLoaded', async () => {
   initTheme();
+  // Load instance name for tab title and sidebar logo
+  try {
+    const cfg = await api('/api/app-config');
+    const name = cfg.instanceName || 'My Agent';
+    const titleEl = document.getElementById('page-title');
+    if (titleEl) titleEl.textContent = name;
+    const sidebarName = document.getElementById('sidebar-instance-name');
+    if (sidebarName) sidebarName.textContent = name;
+    const loginName = document.getElementById('login-instance-name');
+    if (loginName) loginName.textContent = name;
+  } catch (e) { /* keep defaults */ }
   const res = await api('/api/me');
   if (res.authenticated) {
     state.authenticated = true;
@@ -533,6 +544,9 @@ async function openChat(id) {
   // Clear messages immediately — prevents stale content flashing before fetch completes
   document.getElementById('messages-area').innerHTML = '';
   await loadMessages();
+  // Auto-focus the input so the user can start typing immediately
+  const msgInput = document.getElementById('msg-input');
+  if (msgInput) msgInput.focus();
 }
 
 async function loadMessages() {
@@ -610,7 +624,18 @@ function renderMessage(msg) {
   let atts = '';
   const attachments = typeof msg.attachments === 'string' ? JSON.parse(msg.attachments) : (msg.attachments || []);
   if (attachments.length) {
-    atts = `<div class="message-attachments">${attachments.map(a => `<div class="attachment-chip">📎 ${esc(a.name)}</div>`).join('')}</div>`;
+    const voiceAtt = attachments.find(a => a.isVoice);
+    const otherAtts = attachments.filter(a => !a.isVoice);
+    if (voiceAtt) {
+      const audioUrl = `/api/audio/${encodeURIComponent(voiceAtt.name)}`;
+      atts += `<div class="voice-message-player">`;
+      atts += `<audio controls preload="none" src="${audioUrl}" style="width:100%;max-width:320px;height:36px"></audio>`;
+      atts += `<div class="voice-transcript-label">🎤 Voice message</div>`;
+      atts += `</div>`;
+    }
+    if (otherAtts.length) {
+      atts += `<div class="message-attachments">${otherAtts.map(a => `<div class="attachment-chip">📎 ${esc(a.name)}</div>`).join('')}</div>`;
+    }
   }
 
   const ts = formatTimestamp(msg.created_at);
@@ -854,39 +879,200 @@ function removeFile(name, btn) {
 }
 
 // === Voice recording ===
+function resetRecordBtn() {
+  const btn = document.getElementById('record-btn');
+  const cancelBtn = document.getElementById('cancel-record-btn');
+  if (btn) { btn.textContent = '🎤'; btn.title = 'Voice message'; btn.classList.remove('recording'); }
+  if (cancelBtn) cancelBtn.style.display = 'none';
+  state.recording = false;
+  // NOTE: do NOT clear _recordCancelled here — onstop fires async after cancel,
+  // so the flag must survive until onstop reads it. It gets cleared at next recording start.
+}
+
+function stopRecordStream() {
+  if (state._recordStream) {
+    state._recordStream.getTracks().forEach(t => t.stop());
+    state._recordStream = null;
+  }
+  if (state.mediaRecorder && state.mediaRecorder.state !== 'inactive') {
+    state.mediaRecorder.stop();
+  }
+}
+
+function cancelRecord() {
+  state._recordCancelled = true;
+  stopRecordStream();
+  resetRecordBtn();
+}
+
 async function toggleRecord() {
   const btn = document.getElementById('record-btn');
-  if (!state.recording) {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      state.audioChunks = [];
-      state.mediaRecorder = new MediaRecorder(stream);
-      state.mediaRecorder.ondataavailable = e => state.audioChunks.push(e.data);
-      state.mediaRecorder.onstop = async () => {
-        stream.getTracks().forEach(t => t.stop());
-        const blob = new Blob(state.audioChunks, { type: 'audio/webm' });
+  const cancelBtn = document.getElementById('cancel-record-btn');
+
+  // --- Stop recording (send) ---
+  if (state.recording) {
+    state.recording = false;
+    // Kill the stream tracks IMMEDIATELY — mic off right now, before any async work
+    if (state._recordStream) {
+      state._recordStream.getTracks().forEach(t => t.stop());
+      state._recordStream = null;
+    }
+    // Show transcribing state on the button
+    if (btn) { btn.textContent = '⏳'; btn.title = 'Transcribing…'; btn.classList.remove('recording'); }
+    if (cancelBtn) cancelBtn.style.display = 'none';
+    // Stop recorder — onstop will fire and handle transcription/send
+    if (state.mediaRecorder && state.mediaRecorder.state !== 'inactive') {
+      state.mediaRecorder.stop();
+    }
+    return;
+  }
+
+  // --- Start recording ---
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    state._recordStream = stream;
+    state._recordCancelled = false; // clear here — start of fresh recording
+    state.audioChunks = [];
+
+    const mimeType = ['audio/webm;codecs=opus','audio/webm','audio/ogg',''].find(m => !m || MediaRecorder.isTypeSupported(m));
+    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    state.mediaRecorder = recorder;
+
+    recorder.ondataavailable = e => { if (e.data && e.data.size > 0) state.audioChunks.push(e.data); };
+
+    recorder.onstop = async () => {
+      // Ensure stream is dead (stop click already kills it, this is belt-and-suspenders)
+      if (state._recordStream) {
+        state._recordStream.getTracks().forEach(t => t.stop());
+        state._recordStream = null;
+      }
+
+      // If user cancelled, bail — don't send anything
+      if (state._recordCancelled) {
+        resetRecordBtn();
+        return;
+      }
+
+      const blob = new Blob(state.audioChunks, { type: recorder.mimeType || 'audio/webm' });
+      if (!blob.size) { resetRecordBtn(); return; }
+
+      if (!state.currentChat) {
+        // No chat open — just transcribe and drop into input
+        resetRecordBtn();
+        try {
+          const formData = new FormData();
+          formData.append('audio', blob, 'voice.webm');
+          const transcribeRes = await fetchWithTimeout('/api/transcribe', { method: 'POST', body: formData }, 120000);
+          const data = await transcribeRes.json();
+          if (data.text) { document.getElementById('msg-input').value = data.text; autoResize(document.getElementById('msg-input')); }
+        } catch (e) { alert('Transcription failed: ' + e.message); }
+        return;
+      }
+
+      // --- Full voice message flow ---
+      const localAudioUrl = URL.createObjectURL(blob);
+      const chatId = state.currentChat.id;
+      let userMsgId, aiMsgId;
+      try {
+        // Step 1: Create message rows only — agent does NOT run yet
+        const initRes = await api(`/api/chats/${chatId}/send-voice-init`, 'POST');
+        userMsgId = initRes.userMsgId;
+        aiMsgId = initRes.aiMsgId;
+        await loadMessages(); scrollToBottom();
+
+        // Inject local audio player immediately so user can play it back right away
+        renderLocalAudioOnMessage(userMsgId, localAudioUrl);
+
+        // Step 2: Upload audio + transcribe (with timeout)
         const formData = new FormData();
         formData.append('audio', blob, 'voice.webm');
-        btn.textContent = '⏳';
+        let transcribeRes;
         try {
-          const res = await fetch('/api/transcribe', { method: 'POST', body: formData }).then(r => r.json());
-          if (res.text) {
-            document.getElementById('msg-input').value = res.text;
-            autoResize(document.getElementById('msg-input'));
-          }
-        } catch { alert('Transcription failed'); }
-        btn.textContent = '🎤';
-        btn.classList.remove('recording');
-      };
-      state.mediaRecorder.start();
-      state.recording = true;
-      btn.classList.add('recording');
-      btn.title = 'Stop recording';
-    } catch { alert('Microphone access denied'); }
-  } else {
-    state.mediaRecorder.stop();
-    state.recording = false;
+          const resp = await fetchWithTimeout('/api/transcribe', { method: 'POST', body: formData }, 180000);
+          transcribeRes = await resp.json();
+        } catch (e) {
+          // Transcription failed — update placeholder with error, delete AI placeholder
+          await api(`/api/messages/${userMsgId}`, 'PATCH', { content: '🎤 [Transcription failed — ' + e.message + ']' }).catch(() => {});
+          await api(`/api/messages/${aiMsgId}`, 'DELETE').catch(() => {});
+          await loadMessages().catch(() => {}); scrollToBottom();
+          resetRecordBtn();
+          return;
+        }
+        if (transcribeRes.error) {
+          await api(`/api/messages/${userMsgId}`, 'PATCH', { content: '🎤 [Transcription failed — ' + transcribeRes.error + ']' }).catch(() => {});
+          await api(`/api/messages/${aiMsgId}`, 'DELETE').catch(() => {});
+          await loadMessages().catch(() => {}); scrollToBottom();
+          resetRecordBtn();
+          return;
+        }
+        const transcript = transcribeRes.text;
+
+        // Step 3: Update user message with real transcript
+        await api(`/api/messages/${userMsgId}`, 'PATCH', { content: transcript });
+        await loadMessages(); scrollToBottom();
+
+        // Step 4: Now kick the AI with the real transcript
+        // The AI placeholder was already created — send transcript as the agent message
+        await fetch(`/api/chats/${chatId}/send-voice-reply`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            transcript,
+            aiMsgId,
+            audioPath: transcribeRes.audioPath,
+            audioFilename: transcribeRes.audioFilename,
+          })
+        });
+        startLegacyPoll(chatId, aiMsgId);
+      } catch (e) {
+        alert('Voice message failed: ' + e.message);
+      } finally {
+        resetRecordBtn();
+        URL.revokeObjectURL(localAudioUrl);
+      }
+    };
+
+    recorder.onerror = () => {
+      if (state._recordStream) { state._recordStream.getTracks().forEach(t => t.stop()); state._recordStream = null; }
+      resetRecordBtn();
+      alert('Recording error — please try again.');
+    };
+
+    recorder.start();
+    state.recording = true;
+    btn.textContent = '🔴';
+    btn.classList.add('recording');
+    btn.title = 'Stop & send';
+    if (cancelBtn) cancelBtn.style.display = 'inline-flex';
+
+  } catch (e) {
+    resetRecordBtn();
+    alert('Microphone access denied: ' + e.message);
   }
+}
+
+// Fetch with timeout (ms)
+function fetchWithTimeout(url, opts, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => { controller.abort(); reject(new Error('Request timed out')); }, timeoutMs);
+    fetch(url, { ...opts, signal: controller.signal })
+      .then(r => { clearTimeout(timer); resolve(r); })
+      .catch(e => { clearTimeout(timer); reject(e); });
+  });
+}
+
+// Inject a local blob audio player directly into a rendered user message bubble
+function renderLocalAudioOnMessage(msgId, blobUrl) {
+  const el = document.querySelector(`.message[data-id="${msgId}"]`);
+  if (!el) return;
+  const existing = el.querySelector('.voice-message-player');
+  if (existing) return;
+  const player = document.createElement('div');
+  player.className = 'voice-message-player';
+  player.innerHTML = `<audio controls preload="auto" src="${blobUrl}" style="width:100%;max-width:320px;height:36px"></audio><div class="voice-transcript-label">🎤 Voice message</div>`;
+  const content = el.querySelector('.message-content');
+  if (content) content.prepend(player); else el.prepend(player);
 }
 
 // === Projects ===

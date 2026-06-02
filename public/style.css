@@ -179,6 +179,8 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
 .input-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
 .input-attachment { display: flex; align-items: center; gap: 4px; padding: 4px 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; font-size: 12px; color: var(--text-dim); }
 .input-attachment-remove { background: none; border: none; color: var(--text-muted); cursor: pointer; padding: 0 2px; font-size: 14px; line-height: 1; }
+.voice-message-player { margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px; }
+.voice-transcript-label { font-size: 11px; color: var(--text-muted); opacity: 0.7; }
 .input-row { display: flex; align-items: flex-end; gap: 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 10px 14px; transition: border-color 0.2s; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
 .input-row:focus-within { border-color: var(--accent); }
 #msg-input { flex: 1; background: none; border: none; color: var(--text); font-size: 14px; font-family: inherit; resize: none; outline: none; max-height: 150px; min-height: 20px; line-height: 1.5; }
@@ -186,6 +188,8 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
 .input-btn { padding: 6px 8px; background: none; border: none; color: var(--text-muted); cursor: pointer; border-radius: 6px; font-size: 15px; transition: all 0.12s; flex-shrink: 0; }
 .input-btn:hover { background: var(--surface2); color: var(--text); }
 .input-btn.record.recording { color: var(--danger); animation: pulse 1s infinite; }
+.input-btn.cancel-record { color: var(--text-muted); font-size: 12px; padding: 0 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); white-space: nowrap; }
+.input-btn.cancel-record:hover { color: var(--danger); border-color: var(--danger); background: var(--surface); }
 .send-btn { padding: 6px 14px; background: var(--accent); border: none; border-radius: 10px; color: white; font-size: 14px; cursor: pointer; font-family: inherit; font-weight: 500; transition: background 0.12s; flex-shrink: 0; }
 .send-btn:hover { background: var(--accent-hover); }
 .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
