@@ -42,7 +42,7 @@
   --inline-code-bg: #e4dfd4;
 }
 
-body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--text); height: 100vh; overflow: hidden; display: flex; transition: background 0.2s, color 0.2s; }
+body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--text); height: 100vh; height: 100dvh; overflow: hidden; display: flex; transition: background 0.2s, color 0.2s; }
 
 /* Scrollbars */
 ::-webkit-scrollbar { width: 4px; height: 4px; }
@@ -50,7 +50,7 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 
 /* Login */
-#login-screen { display: flex; align-items: center; justify-content: center; width: 100vw; height: 100vh; background: var(--bg); flex-direction: column; gap: 24px; }
+#login-screen { display: flex; align-items: center; justify-content: center; width: 100vw; height: 100vh; height: 100dvh; background: var(--bg); flex-direction: column; gap: 24px; }
 .login-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 40px; width: 360px; display: flex; flex-direction: column; gap: 20px; }
 .login-logo { font-size: 24px; font-weight: 700; color: var(--text); text-align: center; }
 .login-logo span { color: var(--accent); }
@@ -61,7 +61,7 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
 .login-error { color: var(--danger); font-size: 13px; text-align: center; }
 
 /* App layout */
-#app { display: flex; width: 100vw; height: 100vh; overflow: hidden; }
+#app { display: flex; width: 100vw; height: 100vh; height: 100dvh; overflow: hidden; }
 
 /* Sidebar */
 #sidebar { width: var(--sidebar-width); background: var(--sidebar-bg); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; }
@@ -872,16 +872,32 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
     padding-bottom: max(10px, env(safe-area-inset-bottom));
   }
   .input-row { padding: 8px 10px; border-radius: 14px; }
-  #msg-input { font-size: 16px; min-width: 0; flex: 1 1 0; } /* prevent iOS zoom, don't shrink */
-  /* Stop button: icon-only on mobile to save space */
-  .stop-btn { padding: 6px 8px; font-size: 0; border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; }
-  .stop-btn::before { content: '⏹'; font-size: 14px; }
+  #msg-input { font-size: 16px; min-width: 0; flex: 1 1 0; max-height: 100px; } /* prevent iOS zoom, cap height */
+  /* Stop button: full width centered row on mobile when generating */
+  .input-row.generating {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .input-row.generating #msg-input {
+    max-height: 36px !important;
+    min-height: 20px !important;
+    height: 36px !important;
+  }
+  .stop-btn {
+    padding: 8px 16px;
+    font-size: 13px;
+    border-radius: 10px;
+    width: auto;
+    height: auto;
+    flex-shrink: 0;
+  }
 
   /* Messages: less padding */
   #messages-area { padding: 16px 12px 12px; }
 
   /* Allow main to scroll properly on mobile */
-  #main { overflow: hidden; }
+  #main { overflow: hidden; height: 100%; }
 
   /* Login card: full-width on mobile */
   .login-card {
@@ -924,6 +940,11 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
     padding-top: env(safe-area-inset-top);
     padding-left: env(safe-area-inset-left);
     padding-right: env(safe-area-inset-right);
+  }
+
+  /* Keyboard-aware layout: let the input area float up with keyboard */
+  #input-area {
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
   }
 }
 
@@ -1105,6 +1126,9 @@ mark.search-highlight {
   margin-top: 5px;
   justify-content: flex-end;
 }
+.message.assistant .message-actions {
+  justify-content: flex-start;
+}
 .msg-action-btn {
   padding: 3px 9px;
   background: none;
@@ -1234,9 +1258,31 @@ mark.search-highlight {
 }
 
 /* ========================
+   Input row: generating state
+   Hide all controls except stop; textarea stays but dimmed
+   ======================== */
+.input-row.generating .followup-btn,
+.input-row.generating .input-btn,
+.input-row.generating .send-btn {
+  display: none !important;
+}
+.input-row.generating #msg-input {
+  opacity: 0.5;
+  pointer-events: none;
+  /* Reset any auto-resized height so it returns to single line */
+  height: auto !important;
+  max-height: 44px !important;
+}
+.input-row.generating .stop-btn {
+  display: flex !important;
+  flex-shrink: 0;
+}
+
+/* ========================
    Stop generation button
    ======================== */
 .stop-btn {
+  display: none; /* hidden by default; JS shows via updateStopBtn */
   align-items: center;
   gap: 5px;
   padding: 6px 12px;
@@ -1915,4 +1961,46 @@ mark.search-highlight {
   #sse-reconnect-indicator {
     bottom: 90px;
   }
+}
+
+/* ============================================================
+   Pull To Refresh indicator
+   ============================================================ */
+#ptr-indicator {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  margin: 0 auto;
+  width: fit-content;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--surface2, var(--sidebar-bg));
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 6px 14px 6px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+  font-weight: 500;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 9999;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+  will-change: transform, opacity;
+}
+.ptr-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  flex-shrink: 0;
+  transition: transform 0.1s linear;
+}
+.ptr-spinner.ptr-spinning {
+  animation: ptr-spin 0.65s linear infinite;
+}
+@keyframes ptr-spin {
+  to { transform: rotate(360deg); }
 }

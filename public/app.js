@@ -326,6 +326,10 @@ function setupUserMenu(user) {
   if (adminBtn && (user.role === 'admin' || user.role === 'accord')) {
     adminBtn.style.display = 'block';
   }
+  const updateBtn = document.getElementById('update-check-btn');
+  if (updateBtn && (user.role === 'admin' || user.role === 'accord')) {
+    updateBtn.style.display = 'block';
+  }
   // Guest restrictions
   if (user.role === 'guest') {
     applyGuestUI();
@@ -394,9 +398,38 @@ document.addEventListener('keydown', e => {
   }
 });
 
+// --- Global user-event SSE ---
+let globalEventSource = null;
+function startGlobalEventStream() {
+  if (globalEventSource) { globalEventSource.close(); globalEventSource = null; }
+  const es = new EventSource('/api/events');
+  globalEventSource = es;
+
+  es.addEventListener('chat_created', e => {
+    try {
+      const { chat } = JSON.parse(e.data);
+      // Only inject if this user didn't create it (they already have it in state)
+      // and it's not already in state.chats
+      if (chat && !state.chats.find(c => c.id === chat.id)) {
+        state.chats.unshift(chat);
+        renderSidebar();
+      }
+    } catch {}
+  });
+
+  es.onerror = () => {
+    // Auto-reconnect: browser handles it for EventSource, but close and reopen on error
+    setTimeout(() => {
+      if (globalEventSource === es) startGlobalEventStream();
+    }, 5000);
+  };
+}
+
 async function showApp() {
   document.getElementById('app').style.display = 'flex';
   await loadSidebar();
+  // Start global event stream for real-time sidebar updates
+  startGlobalEventStream();
   // Request browser notification permission
   if ('Notification' in window && Notification.permission === 'default') {
     Notification.requestPermission();
@@ -483,8 +516,9 @@ function renderChats(el, filter = '') {
   const projectMap = {};
   state.projects.forEach(p => projectMap[p.id] = p);
 
-  // Flat list sorted by updated_at DESC
-  let chats = [...state.chats];
+  // Flat list sorted by updated_at DESC — deduplicate by id defensively
+  const seenIds = new Set();
+  let chats = state.chats.filter(c => { if (seenIds.has(c.id)) return false; seenIds.add(c.id); return true; });
   chats.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
 
   if (filter) {
@@ -715,7 +749,10 @@ function highlightSnippet(text, query) {
 // === Chat operations ===
 async function newChat(projectId = null) {
   const chat = await api('/api/chats', 'POST', { project_id: projectId || state.currentProject?.id || null });
-  state.chats.unshift(chat);
+  // SSE chat_created may have already added it before the HTTP response returned — guard against duplicate
+  if (!state.chats.find(c => c.id === chat.id)) {
+    state.chats.unshift(chat);
+  }
   // Reload projects so slugify has the latest names
   if (!state.projects.length) state.projects = await api('/api/projects');
   renderSidebar();
@@ -820,9 +857,19 @@ function renderMessages(messages) {
   }
 
   state.artifacts = [];
+  // Pre-compute: which ...thinking... messages have a real message after them?
+  // Those are definitively stale regardless of poll state.
+  const staleThinkingIds = new Set();
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].content === '...thinking...') {
+      // If any subsequent message exists (user or assistant with real content), it's stale
+      const hasFollower = messages.slice(i + 1).some(m => m.content !== '...thinking...');
+      if (hasFollower) staleThinkingIds.add(messages[i].id);
+    }
+  }
   let html = '';
   messages.forEach(msg => {
-    html += renderMessage(msg);
+    html += renderMessage(msg, staleThinkingIds);
     // Extract artifacts from assistant messages
     if (msg.role === 'assistant' && msg.content !== '...thinking...') {
       extractArtifacts(msg.content);
@@ -852,7 +899,7 @@ function formatTimestamp(ts) {
   return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function renderMessage(msg) {
+function renderMessage(msg, staleThinkingIds) {
   const isUser = msg.role === 'user';
 
   // Phase 4: system messages for approval flow
@@ -920,14 +967,17 @@ function renderMessage(msg) {
 
   let content = '';
   if (thinking) {
-    // Show live thinking animation if:
+    // A ...thinking... message is definitively stale if a real message follows it
+    // (pre-computed by renderMessages to avoid DOM query per message)
+    const definitelyStale = staleThinkingIds instanceof Set && staleThinkingIds.has(msg.id);
+
+    // Show live thinking animation if NOT definitively stale AND:
     // - we have a local pending poll for this message, OR
-    // - the server reports the agent is busy in this chat (handles other users' view)
-    const chatPoll = Object.values(state.pendingPolls).find(p => p.aiMsgId === msg.id);
+    // - the server reports the agent is busy working on this specific message
+    const chatPoll = !definitelyStale && Object.values(state.pendingPolls).find(p => p.aiMsgId === msg.id);
     const chatId = state.currentChat?.id;
-    // Only animate THIS specific message if the server is working on it
-    const serverActiveForThisMsg = chatId && state.chatThinkingMsgId[chatId] === msg.id;
-    const isActivePoll = !!chatPoll || serverActiveForThisMsg;
+    const serverActiveForThisMsg = !definitelyStale && chatId && state.chatThinkingMsgId[chatId] === msg.id;
+    const isActivePoll = !definitelyStale && (!!chatPoll || serverActiveForThisMsg);
     if (isActivePoll) {
       const thinkingText = THINKING_MSGS[thinkingMsgIdx] || 'Working on it…';
       content = `<div class="message-bubble thinking"><span class="spinner"></span> <span class="thinking-label">${thinkingText}</span></div>`;
@@ -961,10 +1011,10 @@ function renderMessage(msg) {
   const ts = formatTimestamp(msg.created_at);
   const tsHTML = ts ? `<div class="message-timestamp">${ts}</div>` : '';
 
-  const actionsHTML = (isUser && !thinking)
+  const actionsHTML = !thinking
     ? `<div class="message-actions">
         <button class="msg-action-btn" onclick="copyMsgContent(this)" data-content="${esc(msg.content)}" title="Copy message">Copy</button>
-        <button class="msg-action-btn" onclick="retryMsg(this)" data-content="${esc(msg.content)}" title="Retry this message">↺ Retry</button>
+        ${isUser ? `<button class="msg-action-btn" onclick="retryMsg(this)" data-content="${esc(msg.content)}" title="Retry this message">↺ Retry</button>` : ''}
        </div>`
     : '';
 
@@ -1150,8 +1200,13 @@ function handleKey(e) {
 }
 
 function autoResize(el) {
+  // Don't resize while agent is running — generating state forces a fixed height via CSS
+  const inputRow = document.getElementById('input-row');
+  if (inputRow && inputRow.classList.contains('generating')) return;
   el.style.height = 'auto';
-  el.style.height = Math.min(el.scrollHeight, 150) + 'px';
+  // Cap lower on narrow/mobile screens
+  const maxH = window.innerWidth < 768 ? 100 : 150;
+  el.style.height = Math.min(el.scrollHeight, maxH) + 'px';
 }
 
 // === Per-chat draft persistence ===
@@ -3455,6 +3510,102 @@ function updateStopBtn(chatId) {
   if (!btn) return;
   const active = !!(chatId && hasPendingPoll(chatId));
   btn.style.display = active ? 'flex' : 'none';
+  // Toggle generating class on input row for clean mobile UI
+  const inputRow = document.getElementById('input-row');
+  if (inputRow) {
+    if (active) {
+      inputRow.classList.add('generating');
+    } else {
+      inputRow.classList.remove('generating');
+      // Restore textarea to its natural size
+      const msgInput = document.getElementById('msg-input');
+      if (msgInput) autoResize(msgInput);
+    }
+  }
+}
+
+// ============================================================
+// SELF-UPDATE
+// ============================================================
+
+async function checkForUpdates() {
+  showToast('Checking for updates…', 3000);
+  let data;
+  try {
+    const res = await fetch('/api/update/check');
+    data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Unknown error');
+  } catch (e) {
+    showToast('Update check failed: ' + e.message, 4000);
+    return;
+  }
+
+  if (!data.hasUpdate) {
+    showToast(`You're on the latest version (${data.current})`, 4000);
+    return;
+  }
+
+  const existing = document.getElementById('update-modal');
+  if (existing) existing.remove();
+
+  const modal = document.createElement('div');
+  modal.id = 'update-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:9000';
+  modal.innerHTML = `
+    <div style="background:var(--bg-secondary,#1e1e1e);border:1px solid var(--border,#333);border-radius:12px;padding:28px;max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.4)">
+      <h3 style="margin:0 0 16px;font-size:16px;font-weight:600">Update Available</h3>
+      <div style="font-size:13px;color:var(--text-secondary,#aaa);margin-bottom:20px">
+        <div style="margin-bottom:8px">Current: <strong style="color:var(--text-primary,#fff)">${data.current}</strong></div>
+        <div style="margin-bottom:8px">Latest: <strong style="color:#6ee7b7">${data.latest}</strong></div>
+        <div style="color:var(--text-muted,#666);font-style:italic;font-size:12px">${data.latestLabel || ''}</div>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button onclick="document.getElementById('update-modal').remove()" style="padding:8px 16px;border-radius:6px;border:1px solid var(--border,#333);background:transparent;color:var(--text-primary,#fff);cursor:pointer;font-size:13px">Cancel</button>
+        <button onclick="startUpdateFlow('${data.current}','${data.latest}')" style="padding:8px 16px;border-radius:6px;border:none;background:#6ee7b7;color:#000;cursor:pointer;font-size:13px;font-weight:600">Update Now</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+}
+
+async function startUpdateFlow(currentVersion, latestVersion) {
+  const modal = document.getElementById('update-modal');
+  if (modal) modal.remove();
+
+  const now = new Date();
+  const hh = String(now.getHours()).padStart(2, '0');
+  const mm = String(now.getMinutes()).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  const mo = String(now.getMonth() + 1).padStart(2, '0');
+  const yyyy = now.getFullYear();
+  const chatTitle = `WebUI Update ${hh}:${mm} ${dd}-${mo}-${yyyy}`;
+
+  let projectId = (state.projects && state.projects.length) ? state.projects[0].id : null;
+
+  let chat;
+  try {
+    chat = await api('/api/chats', 'POST', { title: chatTitle, project_id: projectId });
+  } catch (e) {
+    showToast('Failed to create update chat: ' + e.message, 4000);
+    return;
+  }
+
+  state.chats.unshift(chat);
+  renderSidebar();
+  await openChat(chat.id);
+
+  await new Promise(r => setTimeout(r, 400));
+
+  const updateMessage = `Update antar-web to the latest version from GitHub. Current version: ${currentVersion}. Latest version: ${latestVersion}. Run the update using the update.sh script in the antar-web directory (~/openclaw-web/update.sh), then confirm the new version is live.`;
+
+  const input = document.getElementById('message-input');
+  if (input) {
+    input.value = updateMessage;
+    input.dispatchEvent(new Event('input'));
+    await new Promise(r => setTimeout(r, 100));
+    const sendBtn = document.getElementById('send-btn');
+    if (sendBtn) sendBtn.click();
+  }
 }
 
 // ============================================================
@@ -3565,6 +3716,7 @@ async function renderAdminUsers(body) {
 }
 
 function showInviteModal() {
+  const isAdmin = window.currentUser?.role === 'admin';
   const modal = createAdminModal(`
     <h3>Invite New User</h3>
     <label>Email</label>
@@ -3575,6 +3727,7 @@ function showInviteModal() {
     <select id="invite-role">
       <option value="guest">Guest</option>
       <option value="accord">Accord</option>
+      ${isAdmin ? '<option value="admin">Admin</option>' : ''}
     </select>
     <div id="invite-msg"></div>
     <div class="admin-modal-btns">
@@ -3886,14 +4039,14 @@ async function renderAdminTech(body) {
     <div style="margin:16px 0;display:flex;gap:10px;flex-wrap:wrap">
       <button class="admin-btn primary" onclick="doPM2Restart()">⟳ Restart openclaw-web</button>
       <button class="admin-btn danger" onclick="doDeploy()">🚀 Deploy (git pull + restart)</button>
-      <button class="admin-btn" onclick="loadServerLog()">📋 Refresh Logs</button>
     </div>
     <div id="tech-msg" style="font-size:13px;margin-bottom:12px"></div>
-    <div class="admin-section-title" style="margin-top:16px">Server Log (last 100 lines)</div>
-    <div id="log-viewer" class="log-viewer">Loading...</div>
+    <div id="version-section" style="margin-bottom:16px">
+      <div style="color:var(--text-muted);font-size:13px">Loading version...</div>
+    </div>
   `;
   loadPM2Status();
-  loadServerLog();
+  loadVersion();
 }
 
 async function loadPM2Status() {
@@ -3923,16 +4076,28 @@ async function loadPM2Status() {
   }
 }
 
-async function loadServerLog() {
-  const el = document.getElementById('log-viewer');
-  if (!el) return;
-  el.textContent = 'Loading...';
+async function loadVersion() {
+  const section = document.getElementById('version-section');
+  if (!section) return;
   try {
-    const data = await api('/api/admin/server-log');
-    el.textContent = data.log || '(empty)';
-    el.scrollTop = el.scrollHeight;
+    const data = await api('/api/admin/version');
+    if (data.ok) {
+      const dateStr = data.date ? new Date(data.date).toLocaleString() : '';
+      section.innerHTML = `
+        <div style="background:var(--bg-secondary,#1e1e1e);border:1px solid var(--border,#333);border-radius:8px;padding:12px 16px;font-size:13px">
+          <div style="font-weight:600;margin-bottom:6px;color:var(--text-primary)">accord-agentweb version</div>
+          <div style="color:var(--text-muted);line-height:1.8">
+            <span style="font-family:monospace;background:var(--bg-tertiary,#2a2a2a);padding:2px 6px;border-radius:4px">${esc(data.hash)}</span>
+            &nbsp;${esc(data.subject)}
+          </div>
+          ${dateStr ? `<div style="color:var(--text-muted);font-size:12px;margin-top:4px">${dateStr}</div>` : ''}
+        </div>
+      `;
+    } else {
+      section.innerHTML = `<div style="color:var(--text-muted);font-size:13px">Version unavailable</div>`;
+    }
   } catch (e) {
-    el.textContent = 'Error loading log: ' + e.message;
+    section.innerHTML = `<div style="color:var(--text-muted);font-size:13px">Version unavailable</div>`;
   }
 }
 
@@ -3955,6 +4120,7 @@ async function doDeploy() {
     const data = await fetch('/api/admin/deploy', { method: 'POST' }).then(r => r.json());
     if (data.ok) {
       msg.className = 'admin-msg ok'; msg.textContent = '✓ Deployed. Server restarting...';
+      setTimeout(loadVersion, 3000);
     } else {
       msg.className = 'admin-msg err'; msg.textContent = `Error: ${data.error || data.stderr}`;
     }
@@ -4500,3 +4666,122 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 });
 
+
+// ============================================================
+// PULL TO REFRESH (mobile)
+// ============================================================
+(function initPullToRefresh() {
+  // Only run on touch devices
+  if (!('ontouchstart' in window)) return;
+
+  const THRESHOLD  = 60;   // px needed to trigger
+  const MAX_VISUAL = 80;   // px max indicator drop
+
+  // Shared indicator element (fixed, appears below top edge)
+  let ptrEl = null;
+  function getIndicator() {
+    if (ptrEl) return ptrEl;
+    ptrEl = document.createElement('div');
+    ptrEl.id = 'ptr-indicator';
+    ptrEl.innerHTML = '<div class="ptr-spinner"></div><span class="ptr-label">Release to refresh</span>';
+    document.body.appendChild(ptrEl);
+    return ptrEl;
+  }
+
+  function showIndicator(pull, triggered) {
+    const el = getIndicator();
+    el.style.transform = `translateY(${pull}px)`;
+    el.style.opacity = Math.min(1, pull / THRESHOLD).toFixed(2);
+    el.querySelector('.ptr-label').textContent = triggered ? 'Release to refresh' : 'Pull to refresh';
+    el.querySelector('.ptr-spinner').style.transform = `rotate(${Math.min(1, pull / THRESHOLD) * 270}deg)`;
+  }
+
+  function hideIndicator() {
+    const el = getIndicator();
+    el.style.transition = 'transform 0.25s ease, opacity 0.2s ease';
+    el.style.transform = 'translateY(0)';
+    el.style.opacity = '0';
+    setTimeout(() => { el.style.transition = ''; }, 260);
+  }
+
+  function setRefreshing() {
+    const el = getIndicator();
+    el.style.transition = 'transform 0.2s ease';
+    el.style.transform = `translateY(${THRESHOLD}px)`;
+    el.querySelector('.ptr-spinner').classList.add('ptr-spinning');
+    el.querySelector('.ptr-label').textContent = 'Refreshing…';
+    setTimeout(() => { el.style.transition = ''; }, 210);
+  }
+
+  function doneRefreshing() {
+    const el = getIndicator();
+    el.querySelector('.ptr-spinner').classList.remove('ptr-spinning');
+    hideIndicator();
+  }
+
+  function attachPTR(scrollEl, onRefresh) {
+    let startY = 0, pulling = false, refreshing = false;
+
+    scrollEl.addEventListener('touchstart', e => {
+      if (refreshing) return;
+      if (scrollEl.scrollTop > 2) return; // only at top
+      startY = e.touches[0].clientY;
+      pulling = false; // will confirm on move
+    }, { passive: true });
+
+    scrollEl.addEventListener('touchmove', e => {
+      if (refreshing) return;
+      if (scrollEl.scrollTop > 2) { pulling = false; return; }
+      const dy = e.touches[0].clientY - startY;
+      if (dy < 4) return; // ignore upward/tiny
+      pulling = true;
+      const pull = Math.min(MAX_VISUAL, Math.sqrt(dy) * 5.5);
+      showIndicator(pull, pull >= THRESHOLD);
+    }, { passive: true });
+
+    scrollEl.addEventListener('touchend', async e => {
+      if (!pulling || refreshing) { pulling = false; return; }
+      const dy = e.changedTouches[0].clientY - startY;
+      const pull = Math.min(MAX_VISUAL, Math.sqrt(Math.max(0, dy)) * 5.5);
+      pulling = false;
+
+      if (pull >= THRESHOLD) {
+        refreshing = true;
+        setRefreshing();
+        try { await onRefresh(); } catch {}
+        await new Promise(r => setTimeout(r, 350));
+        doneRefreshing();
+        await new Promise(r => setTimeout(r, 260));
+        refreshing = false;
+      } else {
+        hideIndicator();
+      }
+      startY = 0;
+    }, { passive: true });
+  }
+
+  function attachWhenReady() {
+    const messagesArea    = document.getElementById('messages-area');
+    const sidebarContent  = document.getElementById('sidebar-content');
+    if (!messagesArea || !sidebarContent) { setTimeout(attachWhenReady, 400); return; }
+
+    // Ensure indicator exists
+    getIndicator();
+
+    // Messages: refresh current chat
+    attachPTR(messagesArea, async () => {
+      if (state.currentChat) { await loadMessages(); scrollToBottom(); }
+    });
+
+    // Sidebar: reload chat list
+    attachPTR(sidebarContent, async () => {
+      await loadSidebar();
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', attachWhenReady);
+  } else {
+    attachWhenReady();
+  }
+})();

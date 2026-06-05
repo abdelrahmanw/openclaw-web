@@ -6,9 +6,18 @@
   "scripts": {
     "start": "node server.js"
   },
+  "overrides": {
+    "sqlite3": "^6.0.1",
+    "tar": "^7.4.3",
+    "cacache": "^19.0.1",
+    "make-fetch-happen": "^14.0.3",
+    "@tootallnate/once": "^2.0.0",
+    "http-proxy-agent": "^7.0.0"
+  },
   "dependencies": {
-    "bcrypt": "^5.1.1",
-    "connect-sqlite3": "^0.9.14",
+    "bcrypt": "^6.0.0",
+    "connect-sqlite3": "^0.9.16",
+    "dotenv": "^17.4.2",
     "express": "^4.18.3",
     "express-rate-limit": "^8.5.2",
     "express-session": "^1.18.0",
@@ -17,7 +26,6 @@
     "openai": "^4.47.1",
     "sql.js": "^1.14.1",
     "sqlite3": "^6.0.1",
-    "uuid": "^9.0.1",
     "ws": "^8.20.1"
   }
 }

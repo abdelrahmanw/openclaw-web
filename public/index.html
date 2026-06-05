@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"/>
   <title id="page-title">OpenClaw Web</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🤖%3C/text%3E%3C/svg%3E"/>
   <link rel="stylesheet" href="/style.css"/>
@@ -110,6 +110,7 @@
           <div class="user-menu-dropdown" id="user-menu-dropdown" style="display:none">
             <div class="user-menu-email" id="user-menu-email-display"></div>
             <button class="user-menu-item" id="admin-panel-btn" onclick="showAdminPanel(); toggleUserMenu()" style="display:none">Admin Panel</button>
+            <button class="user-menu-item" id="update-check-btn" onclick="checkForUpdates(); toggleUserMenu()" style="display:none">Check for Updates</button>
             <button class="user-menu-item" onclick="showSettingsModal(); toggleUserMenu()">Settings</button>
             <button class="user-menu-item logout" onclick="doLogout()">Sign out</button>
           </div>

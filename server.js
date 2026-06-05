@@ -1,23 +1,84 @@
+require('dotenv').config();
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const session = require('express-session');
 const SQLiteStore = require('connect-sqlite3')(session);
 const multer = require('multer');
 const bcrypt = require('bcrypt');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID: uuidv4 } = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
 const http = require('http');
 const { exec, execFile } = require('child_process');
+// Load local version
+const LOCAL_VERSION_PATH = path.join(__dirname, 'version.json');
+let localVersion = { version: 'unknown', label: '' };
+try { localVersion = JSON.parse(fs.readFileSync(LOCAL_VERSION_PATH, 'utf8')); } catch(e) {}
+
 // Track active agent child processes for abort: { chatId: { child, aiMsgId } }
 const activeAgentProcesses = {};
+
+// Resolve instance config from ~/.openclaw/.env
+function getInstanceConfig() {
+  let name = 'Antar';
+  let url = 'https://your-agent-url';
+  try {
+    const envPath = path.join(process.env.HOME, '.openclaw', '.env');
+    const lines = fs.readFileSync(envPath, 'utf8').split('\n');
+    for (const line of lines) {
+      const mName = line.match(/^INSTANCE_NAME=(.*)$/);
+      if (mName) name = mName[1].trim().replace(/^["']|["']$/g, '');
+      const mUrl = line.match(/^INSTANCE_URL=(.*)$/);
+      if (mUrl) url = mUrl[1].trim().replace(/^["']|["']$/g, '');
+    }
+  } catch (_) {}
+  return { name, url };
+}
 
 // --- Phase 3: SSE Infrastructure ---
 // chatSSEClients: Map<chatId, Set<res>>
 const chatSSEClients = new Map();
 // typingUsers: Map<chatId, Map<userId, lastSeenAt>>
 const typingUsers = new Map();
+
+// --- Global user-event SSE ---
+// userSSEClients: Map<userId|'legacy', Set<res>>
+const userSSEClients = new Map();
+
+function broadcastToUser(userId, eventType, data) {
+  const clients = userSSEClients.get(String(userId));
+  if (!clients || clients.size === 0) return;
+  const payload = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+  clients.forEach(res => { try { res.write(payload); } catch {} });
+}
+
+// Broadcast a global event to all connected users who can see the given chat
+async function broadcastChatCreated(chat, excludeUserId = null) {
+  // Build list of (userId, role) currently subscribed
+  // excludeUserId: skip the user who created the chat (they already have it locally)
+  const excludeStr = excludeUserId ? String(excludeUserId) : null;
+  for (const [uid, clients] of userSSEClients) {
+    if (!clients || clients.size === 0) continue;
+    // Skip the creator — their client handles insertion optimistically
+    if (excludeStr && uid === excludeStr) continue;
+    // Determine if this user can see the chat
+    // legacy sessions (uid === 'legacy') are admin-equivalent
+    if (uid === 'legacy') {
+      // Only skip legacy if there's no excludeUserId (legacy = unauthenticated admin)
+      if (!excludeStr) broadcastToUser('legacy', 'chat_created', { chat });
+      continue;
+    }
+    const user = await db.get_('SELECT role FROM users WHERE id = ?', [uid]);
+    if (!user) continue;
+    if (user.role === 'admin' || user.role === 'accord') {
+      broadcastToUser(uid, 'chat_created', { chat });
+    } else if (user.role === 'guest' && chat.project_id) {
+      const access = await db.get_('SELECT 1 FROM project_access WHERE project_id = ? AND user_id = ?', [chat.project_id, uid]);
+      if (access) broadcastToUser(uid, 'chat_created', { chat });
+    }
+  }
+}
 
 function broadcastToChat(chatId, eventType, data) {
   const clients = chatSSEClients.get(chatId);
@@ -55,9 +116,10 @@ function broadcastQueueUpdate(chatId) {
   broadcastToChat(chatId, 'queue_update', { queue: meta });
 }
 
-function broadcastAgentStatus(chatId, busy) {
+function broadcastAgentStatus(chatId, busy, explicitAiMsgId) {
   const proc = activeAgentProcesses[chatId];
-  const thinkingMsgId = busy && proc ? proc.aiMsgId : null;
+  // Use explicit id (for the pre-runAgent broadcast), then fall back to active process
+  const thinkingMsgId = busy ? (explicitAiMsgId || (proc ? proc.aiMsgId : null)) : null;
   broadcastToChat(chatId, 'agent_status', { busy, thinkingMsgId });
 }
 
@@ -85,7 +147,7 @@ function drainQueue(chatId) {
   if (meta.length === 0) chatQueueMeta.delete(chatId); else chatQueueMeta.set(chatId, meta);
   console.log(`[queue] Draining for chat ${chatId}, remaining=${chatQueues.get(chatId)?.length ?? 0}`);
   chatGatewayBusy.add(chatId);
-  broadcastAgentStatus(chatId, true);
+  broadcastAgentStatus(chatId, true, next.aiMsgId);
   broadcastQueueUpdate(chatId);
   runAgent(next.chat, next.message, next.attachments, next.aiMsgId).finally(() => {
     chatGatewayBusy.delete(chatId);
@@ -350,9 +412,9 @@ app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
         'From: ' + (process.env.ADMIN_EMAIL || 'admin@example.com') + '',
         `To: ${user.email}`,
         'Content-Type: text/plain; charset=utf-8',
-        'Subject: Reset your password',
+        `Subject: Reset your ${getInstanceConfig().name} password`,
         '',
-        `Reset link:\nhttps://your-agent-url/reset-password?token=${resetToken}\n\nExpires in 1 hour.`
+        `Reset link:\n${getInstanceConfig().url}/reset-password?token=${resetToken}\n\nExpires in 1 hour.`
       ].join('\r\n');
       await gmail.users.messages.send({ userId: 'me', requestBody: { raw: Buffer.from(rawEmail).toString('base64url') } });
       console.log(`[auth] Password reset email sent to ${user.email}`);
@@ -520,7 +582,10 @@ app.post('/api/chats', async (req, res) => {
       'INSERT INTO chats (id, project_id, title, session_id, telegram_session_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [id, project_id || null, title || 'New Chat', session_id, telegram_session_key || null, now, now]
     );
-    res.json(await db.get_('SELECT * FROM chats WHERE id = ?', [id]));
+    const created = await db.get_('SELECT * FROM chats WHERE id = ?', [id]);
+  // Broadcast to all OTHER connected users — exclude creator to prevent duplicate sidebar entry
+  broadcastChatCreated(created, userId || null).catch(() => {});
+  res.json(created);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -584,6 +649,40 @@ app.get('/api/chats/search', requireAuth, async (req, res) => {
     });
     res.json(results);
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Update check ---
+app.get('/api/update/check', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  try {
+    const GH_TOKEN = process.env.GH_UPDATE_TOKEN || '';
+    const API_URL = 'https://api.github.com/repos/abdelrahmanw/openclaw-web/contents/version.json';
+    const remoteRaw = await new Promise((resolve, reject) => {
+      https.get(API_URL, {
+        headers: {
+          'Authorization': `token ${GH_TOKEN}`,
+          'Accept': 'application/vnd.github.v3.raw',
+          'User-Agent': 'antar-web-updater'
+        }
+      }, (r) => {
+        let data = '';
+        r.on('data', chunk => data += chunk);
+        r.on('end', () => resolve(data));
+        r.on('error', reject);
+      }).on('error', reject);
+    });
+    const remote = JSON.parse(remoteRaw);
+    res.json({
+      current: localVersion.version,
+      currentLabel: localVersion.label,
+      latest: remote.version,
+      latestLabel: remote.label,
+      latestCommit: remote.commit,
+      pushedAt: remote.pushed_at,
+      hasUpdate: remote.version !== localVersion.version
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to check for updates: ' + e.message });
+  }
 });
 
 // --- Rename all chats ---
@@ -687,7 +786,7 @@ app.post('/api/chats/:id/send', upload.array('files'), async (req, res) => {
       enqueueMessage(chat, agentMessage, attachments, aiMsgId, senderName);
     } else {
       chatGatewayBusy.add(chat.id);
-      broadcastAgentStatus(chat.id, true);
+      broadcastAgentStatus(chat.id, true, aiMsgId);
       runAgent(chat, agentMessage, attachments, aiMsgId);
     }
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -905,6 +1004,10 @@ app.post('/api/admin/users/invite', requireAuth, requireRole('admin', 'accord'),
   try {
     const { email, role, display_name } = req.body;
     if (!email || !role) return res.status(400).json({ error: 'Email and role required' });
+    // Only admins can create admin users
+    if (role === 'admin' && getSessionRole(req) !== 'admin') {
+      return res.status(403).json({ error: 'Only admins can create admin users' });
+    }
     const existing = await db.get_('SELECT id FROM users WHERE email = ?', [email.toLowerCase().trim()]);
     if (existing) return res.status(409).json({ error: 'User with this email already exists' });
 
@@ -918,28 +1021,33 @@ app.post('/api/admin/users/invite', requireAuth, requireRole('admin', 'accord'),
       [id, email.toLowerCase().trim(), display_name || email.split('@')[0], passwordHash, role, Date.now(), inviterId]
     );
 
-    // Send invite email via Gmail API
+    // Send invite email via configured email provider/relay
     try {
-      const { google } = require('googleapis');
-      const creds = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.openclaw', 'workspace', 'google-creds.json')));
-      const tokenData = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.openclaw', 'workspace', 'google-token.json')));
-      const installed = creds.installed || creds.web || creds;
-      const oauth2 = new google.auth.OAuth2(
-        installed.client_id, installed.client_secret,
-        (installed.redirect_uris || ['urn:ietf:wg:oauth:2.0:oob'])[0]
-      );
-      oauth2.setCredentials(tokenData);
-      const gmail = google.gmail({ version: 'v1', auth: oauth2 });
-      const rawEmail = [
-        'From: ' + (process.env.ADMIN_EMAIL || 'admin@example.com') + '',
-        `To: ${email}`,
-        'Content-Type: text/plain; charset=utf-8',
-        'Subject: You\'ve been invited to Antar',
-        '',
-        `You've been invited at https://your-agent-url\n\nYour temporary password is: ${tempPassword}\n\nPlease log in and change your password in Settings.`
-      ].join('\r\n');
-      await gmail.users.messages.send({ userId: 'me', requestBody: { raw: Buffer.from(rawEmail).toString('base64url') } });
-      console.log(`[admin] Invite email sent to ${email}`);
+      const { sendEmail } = require('./email');
+      const { name: _instanceName, url: _instanceUrl } = getInstanceConfig();
+      const cleanEmail = email.toLowerCase().trim();
+      await sendEmail({
+        to: cleanEmail,
+        subject: `You've been invited to ${_instanceName}`,
+        body: [
+          `You've been invited to ${_instanceName}.`,
+          '',
+          `URL: ${_instanceUrl}`,
+          `Email: ${cleanEmail}`,
+          `Temporary password: ${tempPassword}`,
+          '',
+          'Please log in and change your password in Settings.'
+        ].join('\n'),
+        bodyHtml: `
+          <div style="font-family:Arial,sans-serif;font-size:15px;line-height:1.5;color:#111827">
+            <p>You've been invited to <strong>${_instanceName}</strong>.</p>
+            <p><strong>URL:</strong> <a href="${_instanceUrl}">${_instanceUrl}</a><br>
+            <strong>Email:</strong> ${cleanEmail}<br>
+            <strong>Temporary password:</strong> <code style="font-size:16px">${tempPassword}</code></p>
+            <p>Please log in and change your password in Settings.</p>
+          </div>`
+      });
+      console.log(`[admin] Invite email sent to ${cleanEmail}`);
     } catch (mailErr) {
       console.error('[admin] Failed to send invite email:', mailErr.message);
     }
@@ -1091,15 +1199,18 @@ app.post('/api/admin/pm2-restart', requireAuth, requireRole('admin'), async (req
 });
 
 // Server log (admin only)
-app.get('/api/admin/server-log', requireAuth, requireRole('admin'), async (req, res) => {
-  exec('pm2 logs openclaw-web --lines 100 --nostream --no-color 2>&1 || tail -100 /tmp/openclaw-web.log 2>/dev/null || echo "No log available"', (err, stdout) => {
-    res.json({ ok: true, log: stdout || '' });
+// Version info
+app.get('/api/admin/version', requireAuth, requireRole('admin'), async (req, res) => {
+  exec(`cd ${__dirname} && git log -1 --format="%h|%s|%ci" 2>&1`, (err, stdout) => {
+    if (err || !stdout.trim()) return res.json({ ok: false, version: 'unknown' });
+    const [hash, subject, date] = stdout.trim().split('|');
+    res.json({ ok: true, hash: hash?.trim(), subject: subject?.trim(), date: date?.trim() });
   });
 });
 
 // Deploy (admin only)
 app.post('/api/admin/deploy', requireAuth, requireRole('admin'), async (req, res) => {
-  const cmd = 'cd /home/clawdbot/openclaw-web && git pull && pm2 restart openclaw-web';
+  const cmd = `cd ${__dirname} && git pull && pm2 restart openclaw-web`;
   exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
     res.json({ ok: !err, stdout, stderr, error: err?.message });
   });
@@ -1141,27 +1252,31 @@ app.post('/api/projects/:id/invite-guest', requireAuth, requireRole('admin', 'ac
       );
       isNew = true;
 
-      // Send invite email
+      // Send invite email via configured email provider/relay
       try {
-        const { google } = require('googleapis');
-        const creds = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.openclaw', 'workspace', 'google-creds.json')));
-        const tokenData = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.openclaw', 'workspace', 'google-token.json')));
-        const installed = creds.installed || creds.web || creds;
-        const oauth2 = new google.auth.OAuth2(
-          installed.client_id, installed.client_secret,
-          (installed.redirect_uris || ['urn:ietf:wg:oauth:2.0:oob'])[0]
-        );
-        oauth2.setCredentials(tokenData);
-        const gmail = google.gmail({ version: 'v1', auth: oauth2 });
-        const rawEmail = [
-          'From: ' + (process.env.ADMIN_EMAIL || 'admin@example.com') + '',
-          `To: ${cleanEmail}`,
-          'Content-Type: text/plain; charset=utf-8',
-          `Subject: You've been invited to the "${project.name}" project on Antar`,
-          '',
-          `You've been invited to collaborate on the "${project.name}" project on OpenClaw Web.\n\nURL: https://your-agent-url\nEmail: ${cleanEmail}\nTemporary password: ${tempPassword}\n\nPlease log in and change your password in Settings.`
-        ].join('\r\n');
-        await gmail.users.messages.send({ userId: 'me', requestBody: { raw: Buffer.from(rawEmail).toString('base64url') } });
+        const { sendEmail } = require('./email');
+        const { name: _instanceName, url: _instanceUrl } = getInstanceConfig();
+        await sendEmail({
+          to: cleanEmail,
+          subject: `You've been invited to the "${project.name}" project on ${_instanceName}`,
+          body: [
+            `You've been invited to collaborate on the "${project.name}" project on ${_instanceName}.`,
+            '',
+            `URL: ${_instanceUrl}`,
+            `Email: ${cleanEmail}`,
+            `Temporary password: ${tempPassword}`,
+            '',
+            'Please log in and change your password in Settings.'
+          ].join('\n'),
+          bodyHtml: `
+            <div style="font-family:Arial,sans-serif;font-size:15px;line-height:1.5;color:#111827">
+              <p>You've been invited to collaborate on the <strong>${project.name}</strong> project on <strong>${_instanceName}</strong>.</p>
+              <p><strong>URL:</strong> <a href="${_instanceUrl}">${_instanceUrl}</a><br>
+              <strong>Email:</strong> ${cleanEmail}<br>
+              <strong>Temporary password:</strong> <code style="font-size:16px">${tempPassword}</code></p>
+              <p>Please log in and change your password in Settings.</p>
+            </div>`
+        });
         console.log(`[project-invite] Invite email sent to ${cleanEmail}`);
       } catch (mailErr) {
         console.error('[project-invite] Failed to send invite email:', mailErr.message);
@@ -1593,6 +1708,36 @@ app.get('/api/chats/:id/stream', requireAuth, (req, res) => {
   });
 });
 
+// Global user-event SSE stream — one connection per browser tab, receives cross-chat events
+app.get('/api/events', requireAuth, (req, res) => {
+  const userId = req.session.userId ? String(req.session.userId) : 'legacy';
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  if (!userSSEClients.has(userId)) userSSEClients.set(userId, new Set());
+  userSSEClients.get(userId).add(res);
+
+  // Send connected event
+  res.write(`event: connected\ndata: ${JSON.stringify({ userId })}\n\n`);
+
+  // Heartbeat every 25s
+  const heartbeat = setInterval(() => {
+    try { res.write(': heartbeat\n\n'); } catch {}
+  }, 25000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    const clients = userSSEClients.get(userId);
+    if (clients) {
+      clients.delete(res);
+      if (clients.size === 0) userSSEClients.delete(userId);
+    }
+  });
+});
+
 // Typing indicator
 app.post('/api/chats/:id/typing', requireAuth, async (req, res) => {
   try {
@@ -1642,7 +1787,7 @@ app.post('/api/chats/:id/open', requireAuth, async (req, res) => {
       [req.params.id, userId, 'owner', Date.now()]
     );
     await db.run_('UPDATE chats SET is_open = 1 WHERE id = ?', [req.params.id]);
-    res.json({ ok: true, token, inviteUrl: `https://your-agent-url/join/${token}` });
+    res.json({ ok: true, token, inviteUrl: `${getInstanceConfig().url}/join/${token}` });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1776,7 +1921,7 @@ app.get('/api/chats/:id/invite', requireAuth, async (req, res) => {
   try {
     const invite = await db.get_('SELECT * FROM chat_invites WHERE chat_id = ? AND active = 1 ORDER BY created_at DESC LIMIT 1', [req.params.id]);
     if (!invite) return res.json({ token: null });
-    res.json({ token: invite.token, inviteUrl: `https://your-agent-url/join/${invite.token}` });
+    res.json({ token: invite.token, inviteUrl: `${getInstanceConfig().url}/join/${invite.token}` });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1931,6 +2076,32 @@ app.get('/api/approvals/:id', requireAuth, async (req, res) => {
     const guest = await db.get_('SELECT display_name FROM users WHERE id = ?', [approval.guest_user_id]);
     res.json({ ...approval, guest_display_name: guest?.display_name || 'Guest' });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Internal email relay endpoint ---
+app.post('/internal/send-email', async (req, res) => {
+  try {
+    // Auth: Bearer <EMAIL_RELAY_SECRET>
+    const envLines = (() => { try { return fs.readFileSync(path.join(process.env.HOME || '/home/clawdbot', '.openclaw', '.env'), 'utf8').split('\n'); } catch { return []; } })();
+    const extraEnv = {};
+    for (const line of envLines) { const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/); if (m) extraEnv[m[1]] = m[2].replace(/^["']|["']$/g, '').trim(); }
+    const relaySecret = extraEnv.EMAIL_RELAY_SECRET || process.env.EMAIL_RELAY_SECRET;
+    if (!relaySecret) return res.status(500).json({ error: 'EMAIL_RELAY_SECRET not configured' });
+
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (token !== relaySecret) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { to, subject, body, bodyHtml } = req.body;
+    if (!to || !subject) return res.status(400).json({ error: 'to and subject are required' });
+
+    const { sendEmail } = require('./email');
+    await sendEmail({ to, subject, body, bodyHtml });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[send-email] error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // --- SPA catch-all: serve index.html for any non-API, non-share, non-static path ---
