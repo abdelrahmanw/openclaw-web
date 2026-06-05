@@ -220,6 +220,15 @@ window.addEventListener('DOMContentLoaded', async () => {
   setupDragDrop();
   setupMarked();
   setupPaste();
+
+  // Clicking anywhere on the input-row always focuses the textarea
+  const inputRow = document.getElementById('input-row');
+  if (inputRow) {
+    inputRow.addEventListener('click', (e) => {
+      const msgInput = document.getElementById('msg-input');
+      if (msgInput && e.target !== msgInput) msgInput.focus();
+    });
+  }
 });
 
 function setupMarked() {
@@ -1152,7 +1161,30 @@ function startLegacyPoll(chatId, aiMsgId) {
       } else { markChatReplied(chatId); updateStopBtn(chatId); }
     }
   }, 1500);
-  state.pendingPolls[chatId] = { aiMsgId, interval };
+  // Watchdog: if SSE misses the busy=false event, recover after 150s
+  const watchdog = setTimeout(async function tickWatchdog() {
+    const p = state.pendingPolls[chatId];
+    if (!p || p.aiMsgId !== aiMsgId) return; // already cleared
+    try {
+      const msg = await api(`/api/messages/${aiMsgId}`);
+      if (msg && msg.content !== '...thinking...' && msg.content !== '') {
+        // Response already written — SSE missed the done signal
+        clearPollInterval(chatId);
+        playDing();
+        stopThinkingCycle();
+        const isViewing = state.currentChat?.id === chatId;
+        const chatTitle = state.chats.find(c => c.id === chatId)?.title || 'Chat';
+        showCompletionToast(isViewing ? '✓ Replied' : `✓ Reply ready in "${chatTitle}"`);
+        if (isViewing) { await loadMessages(); scrollToBottom(); }
+        else { markChatReplied(chatId); }
+        return;
+      }
+    } catch {}
+    // Still thinking — extend by 30s and check again
+    const pp = state.pendingPolls[chatId];
+    if (pp && pp.aiMsgId === aiMsgId) pp.watchdog = setTimeout(tickWatchdog, 30000);
+  }, 150000);
+  state.pendingPolls[chatId] = { aiMsgId, interval, watchdog };
   updateStopBtn(chatId);
   if (state.currentChat?.id === chatId) { loadMessages().then(scrollToBottom); }
 }
@@ -1167,6 +1199,8 @@ function clearPollInterval(chatId) {
       if (p.abort) { try { p.abort(); } catch {} }
       // Legacy poll: clear interval
       if (p.interval) clearInterval(p.interval);
+      // Watchdog: cancel pending recovery timer
+      if (p.watchdog) clearTimeout(p.watchdog);
       delete state.pendingPolls[chatId];
       state.chatThinkingMsgId[chatId] = null; // clear in-flight tracking
     }
@@ -1200,9 +1234,6 @@ function handleKey(e) {
 }
 
 function autoResize(el) {
-  // Don't resize while agent is running — generating state forces a fixed height via CSS
-  const inputRow = document.getElementById('input-row');
-  if (inputRow && inputRow.classList.contains('generating')) return;
   el.style.height = 'auto';
   // Cap lower on narrow/mobile screens
   const maxH = window.innerWidth < 768 ? 100 : 150;
@@ -3707,6 +3738,7 @@ async function renderAdminUsers(body) {
                 ? `<button class="admin-btn sm danger" onclick="toggleUserActive('${u.id}',0)">Deactivate</button>`
                 : `<button class="admin-btn sm" onclick="toggleUserActive('${u.id}',1)">Reactivate</button>`
               }
+              ${window.currentUser?.role === 'admin' ? `<button class="admin-btn sm danger" onclick="deleteUser('${u.id}','${esc(u.email)}')">Delete</button>` : ''}
             </td>
           </tr>
         `).join('')}
@@ -3808,6 +3840,20 @@ async function toggleUserActive(userId, active) {
       body: JSON.stringify({ active })
     });
     loadAdminTab('users');
+  } catch (e) { alert(e.message); }
+}
+
+async function deleteUser(userId, email) {
+  if (!confirm(`Permanently delete user "${email}"?\n\nThis cannot be undone. All their project access, permissions, and session data will be removed.`)) return;
+  try {
+    const res = await fetch(`/api/admin/users/${userId}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`User ${email} deleted.`);
+      loadAdminTab('users');
+    } else {
+      alert(data.error || 'Failed to delete user.');
+    }
   } catch (e) { alert(e.message); }
 }
 
@@ -4036,9 +4082,10 @@ async function renderAdminTech(body) {
     <div id="pm2-status-section">
       <div style="color:var(--text-muted);font-size:13px">Loading PM2 status...</div>
     </div>
-    <div style="margin:16px 0;display:flex;gap:10px;flex-wrap:wrap">
+    <div style="margin:16px 0;display:flex;gap:10px;flex-wrap:wrap;align-items:center">
       <button class="admin-btn primary" onclick="doPM2Restart()">⟳ Restart openclaw-web</button>
       <button class="admin-btn danger" onclick="doDeploy()">🚀 Deploy (git pull + restart)</button>
+      <span id="version-badge" style="font-size:13px;color:var(--text-muted)">Loading...</span>
     </div>
     <div id="tech-msg" style="font-size:13px;margin-bottom:12px"></div>
     <div id="version-section" style="margin-bottom:16px">
@@ -4078,11 +4125,15 @@ async function loadPM2Status() {
 
 async function loadVersion() {
   const section = document.getElementById('version-section');
+  const badge = document.getElementById('version-badge');
   if (!section) return;
   try {
     const data = await api('/api/admin/version');
     if (data.ok) {
       const dateStr = data.date ? new Date(data.date).toLocaleString() : '';
+      // Inline badge: prefer friendly version label, fall back to short hash
+      const badgeText = data.versionLabel || data.hash || 'unknown';
+      if (badge) badge.textContent = badgeText;
       section.innerHTML = `
         <div style="background:var(--bg-secondary,#1e1e1e);border:1px solid var(--border,#333);border-radius:8px;padding:12px 16px;font-size:13px">
           <div style="font-weight:600;margin-bottom:6px;color:var(--text-primary)">accord-agentweb version</div>
@@ -4094,9 +4145,11 @@ async function loadVersion() {
         </div>
       `;
     } else {
+      if (badge) badge.textContent = 'unknown';
       section.innerHTML = `<div style="color:var(--text-muted);font-size:13px">Version unavailable</div>`;
     }
   } catch (e) {
+    if (badge) badge.textContent = 'unavailable';
     section.innerHTML = `<div style="color:var(--text-muted);font-size:13px">Version unavailable</div>`;
   }
 }
@@ -4276,13 +4329,31 @@ function connectChatSSE(chatId) {
   const es = new EventSource(`/api/chats/${chatId}/stream`);
   state.chatSSE.set(chatId, es);
 
+  // Dead-connection detector: track last heartbeat timestamp
+  let lastHeartbeatAt = Date.now();
+  const heartbeatWatchdog = setInterval(() => {
+    if (state.chatSSE.get(chatId) !== es) { clearInterval(heartbeatWatchdog); return; } // stale
+    if (Date.now() - lastHeartbeatAt > 35000) {
+      // Missed 2+ heartbeats — connection is silently dead
+      clearInterval(heartbeatWatchdog);
+      try { es.close(); } catch {}
+      state.chatSSE.delete(chatId);
+      if (state.currentChat?.id === chatId) connectChatSSE(chatId);
+    }
+  }, 20000);
+
   es.onopen = () => {
-    // Reset backoff on successful connection
+    // Reset backoff and heartbeat clock on successful connection
+    lastHeartbeatAt = Date.now();
     sseBackoffState.set(chatId, { retries: 0 });
     // Hide reconnecting indicator if shown
     const ind = document.getElementById('sse-reconnect-indicator');
     if (ind) ind.style.display = 'none';
   };
+
+  es.addEventListener('heartbeat', () => {
+    lastHeartbeatAt = Date.now();
+  });
 
   es.addEventListener('message', async () => {
     // New message arrived — reload messages if we're viewing this chat
@@ -4306,7 +4377,10 @@ function connectChatSSE(chatId) {
         // Clear synthetic poll if agent finished
         const p = state.pendingPolls[chatId];
         if (p && p.synthetic) clearPollInterval(chatId);
-        if (state.currentChat?.id === chatId) updateStopBtn(chatId);
+        if (state.currentChat?.id === chatId) {
+          updateStopBtn(chatId);
+          processNextQueueItem(chatId);
+        }
       }
       // Re-render messages so thinking state updates correctly
       if (state.currentChat?.id === chatId) {
@@ -4378,6 +4452,7 @@ function connectChatSSE(chatId) {
   });
 
   es.onerror = () => {
+    clearInterval(heartbeatWatchdog);
     try { es.close(); } catch {}
     state.chatSSE.delete(chatId);
 

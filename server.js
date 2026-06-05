@@ -89,6 +89,11 @@ function broadcastToChat(chatId, eventType, data) {
   });
 }
 
+// Send a single SSE event to one specific response (for on-connect state sync)
+function sendToClient(res, eventType, data) {
+  try { res.write(`event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`); } catch {}
+}
+
 // Clean up stale typing users every 5s
 setInterval(() => {
   const now = Date.now();
@@ -1088,6 +1093,45 @@ app.put('/api/admin/users/:id', requireAuth, requireRole('admin', 'accord'), asy
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Delete user (admin only — hard delete with cascade)
+app.delete('/api/admin/users/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const targetId = req.params.id;
+    const actorId = req.session.userId || 'legacy';
+
+    // Prevent self-delete
+    if (actorId !== 'legacy' && actorId === targetId) {
+      return res.status(400).json({ error: 'You cannot delete your own account.' });
+    }
+
+    const target = await db.get_('SELECT * FROM users WHERE id = ?', [targetId]);
+    if (!target) return res.status(404).json({ error: 'User not found' });
+
+    // Prevent deleting the last admin
+    if (target.role === 'admin') {
+      const adminCount = await db.get_('SELECT COUNT(*) as cnt FROM users WHERE role = ?', ['admin']);
+      if (adminCount && adminCount.cnt <= 1) {
+        return res.status(400).json({ error: 'Cannot delete the last admin account.' });
+      }
+    }
+
+    // Cascade: delete related data
+    await db.run_('DELETE FROM project_access WHERE user_id = ?', [targetId]);
+    await db.run_('DELETE FROM guest_permissions WHERE user_id = ?', [targetId]);
+    await db.run_('DELETE FROM chat_participants WHERE user_id = ?', [targetId]);
+    await db.run_('DELETE FROM permission_approvals WHERE guest_user_id = ?', [targetId]);
+    await db.run_('DELETE FROM password_reset_tokens WHERE user_id = ?', [targetId]);
+    await db.run_('DELETE FROM users WHERE id = ?', [targetId]);
+
+    // Audit log
+    const actorUser = req.session.userId ? await db.get_('SELECT email FROM users WHERE id = ?', [actorId]) : null;
+    const actorEmail = actorUser?.email || 'legacy';
+    await writeAuditLog({ actorUserId: actorId, actorEmail, action: 'user_deleted', target: target.email, details: { role: target.role } });
+
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Get guest permissions
 app.get('/api/admin/guest-permissions/:userId', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
   try {
@@ -1193,7 +1237,8 @@ app.get('/api/admin/pm2-status', requireAuth, requireRole('admin'), async (req, 
 
 // PM2 restart (admin only)
 app.post('/api/admin/pm2-restart', requireAuth, requireRole('admin'), async (req, res) => {
-  exec('pm2 restart openclaw-web', (err, stdout, stderr) => {
+  const pm2Name = process.env.PM2_APP_NAME || 'antar-web';
+  exec(`pm2 restart ${pm2Name}`, (err, stdout, stderr) => {
     res.json({ ok: !err, stdout, stderr, error: err?.message });
   });
 });
@@ -1204,15 +1249,31 @@ app.get('/api/admin/version', requireAuth, requireRole('admin'), async (req, res
   exec(`cd ${__dirname} && git log -1 --format="%h|%s|%ci" 2>&1`, (err, stdout) => {
     if (err || !stdout.trim()) return res.json({ ok: false, version: 'unknown' });
     const [hash, subject, date] = stdout.trim().split('|');
-    res.json({ ok: true, hash: hash?.trim(), subject: subject?.trim(), date: date?.trim() });
+    // Also read version.json for the friendly version label
+    let versionLabel = null;
+    try {
+      const vj = JSON.parse(require('fs').readFileSync(path.join(__dirname, 'version.json'), 'utf8'));
+      versionLabel = vj.version || null;
+    } catch (_) {}
+    res.json({ ok: true, hash: hash?.trim(), subject: subject?.trim(), date: date?.trim(), versionLabel });
   });
 });
 
 // Deploy (admin only)
 app.post('/api/admin/deploy', requireAuth, requireRole('admin'), async (req, res) => {
-  const cmd = `cd ${__dirname} && git pull && pm2 restart openclaw-web`;
-  exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
-    res.json({ ok: !err, stdout, stderr, error: err?.message });
+  const pm2AppName = process.env.PM2_APP_NAME || 'antar-web';
+  // Run git pull first, send response, THEN restart (so response isn't killed mid-flight)
+  exec(`cd ${__dirname} && git pull`, { timeout: 60000 }, (err, stdout, stderr) => {
+    const pullOutput = (stdout || '') + (stderr || '');
+    if (err) {
+      return res.json({ ok: false, stdout, stderr, error: err?.message });
+    }
+    // Send success response before restarting
+    res.json({ ok: true, stdout: pullOutput, stderr: '', error: null });
+    // Restart after a short delay so the response has time to flush
+    setTimeout(() => {
+      exec(`pm2 restart ${pm2AppName}`, () => {});
+    }, 500);
   });
 });
 
@@ -1686,10 +1747,10 @@ app.get('/api/chats/:id/stream', requireAuth, (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  // Send heartbeat comment every 25s
+  // Named heartbeat event every 15s (visible to client addEventListener)
   const heartbeat = setInterval(() => {
-    try { res.write(': heartbeat\n\n'); } catch {}
-  }, 25000);
+    try { res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`); } catch {}
+  }, 15000);
 
   // Register client
   if (!chatSSEClients.has(chatId)) chatSSEClients.set(chatId, new Set());
@@ -1697,6 +1758,13 @@ app.get('/api/chats/:id/stream', requireAuth, (req, res) => {
 
   // Send connected event
   res.write(`event: connected\ndata: ${JSON.stringify({ chatId })}\n\n`);
+
+  // State sync: if agent is currently running for this chat, tell the new/reconnected client
+  if (chatGatewayBusy.has(chatId)) {
+    const proc = activeAgentProcesses[chatId];
+    const thinkingMsgId = proc ? proc.aiMsgId : null;
+    sendToClient(res, 'agent_status', { busy: true, thinkingMsgId });
+  }
 
   req.on('close', () => {
     clearInterval(heartbeat);
@@ -1723,10 +1791,10 @@ app.get('/api/events', requireAuth, (req, res) => {
   // Send connected event
   res.write(`event: connected\ndata: ${JSON.stringify({ userId })}\n\n`);
 
-  // Heartbeat every 25s
+  // Named heartbeat event every 15s (visible to client addEventListener)
   const heartbeat = setInterval(() => {
-    try { res.write(': heartbeat\n\n'); } catch {}
-  }, 25000);
+    try { res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`); } catch {}
+  }, 15000);
 
   req.on('close', () => {
     clearInterval(heartbeat);
