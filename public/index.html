@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
   <title id="page-title">OpenClaw Web</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🤖%3C/text%3E%3C/svg%3E"/>
   <link rel="stylesheet" href="/style.css"/>
@@ -17,18 +17,45 @@
 <div id="login-screen" style="display:none">
   <div class="login-card">
     <div class="login-logo"><span id="login-instance-name">My Agent</span></div>
-    <input type="password" class="login-input" id="login-pw" placeholder="Password" autofocus/>
-    <button class="login-btn" onclick="doLogin()">Sign in</button>
-    <div class="login-error" id="login-error" style="display:none"></div>
+    <div id="login-form-view">
+      <input type="email" class="login-input" id="login-email" placeholder="Email" autocomplete="email"/>
+      <input type="password" class="login-input" id="login-pw" placeholder="Password"/>
+      <label class="remember-me-label"><input type="checkbox" id="login-remember"/> Remember me for 30 days</label>
+      <button class="login-btn" onclick="doLogin()">Sign in</button>
+      <button class="login-link-btn" onclick="showForgotForm()">Forgot password?</button>
+      <div class="login-error" id="login-error" style="display:none"></div>
+    </div>
+    <div id="forgot-form-view" style="display:none">
+      <p class="login-subtitle">Enter your email to receive a reset link.</p>
+      <input type="email" class="login-input" id="forgot-email" placeholder="Email" autocomplete="email"/>
+      <button class="login-btn" onclick="doForgotPassword()">Send reset link</button>
+      <button class="login-link-btn" onclick="showLoginForm()">← Back to sign in</button>
+      <div class="login-error" id="forgot-msg" style="display:none"></div>
+    </div>
   </div>
 </div>
+
+<!-- Reset Password -->
+<div id="reset-password-screen" style="display:none">
+  <div class="login-card">
+    <div class="login-logo">OpenClaw Web</div>
+    <p class="login-subtitle">Set a new password.</p>
+    <input type="password" class="login-input" id="reset-pw" placeholder="New password (min 8 chars)"/>
+    <input type="password" class="login-input" id="reset-pw2" placeholder="Confirm new password"/>
+    <button class="login-btn" onclick="doResetPassword()">Set new password</button>
+    <div class="login-error" id="reset-msg" style="display:none"></div>
+  </div>
+</div>
+
+<!-- Sidebar backdrop (mobile) -->
+<div id="sidebar-overlay" onclick="toggleSidebar()"></div>
 
 <!-- App -->
 <div id="app" style="display:none">
   <!-- Sidebar -->
   <div id="sidebar">
     <div class="sidebar-header">
-      <div class="logo"><div class="logo-icon">🤖</div> <span id="sidebar-instance-name">My Agent</span></div>
+      <div class="logo"><div class="logo-icon">🤖</div> <span id="sidebar-instance-name">Antar</span></div>
       <button class="new-chat-btn" onclick="newChat()">+ New Chat</button>
       <input type="text" class="sidebar-search" placeholder="Search chats..." oninput="filterChats(this.value)" id="search-input"/>
     </div>
@@ -42,15 +69,52 @@
   <!-- Main -->
   <div id="main">
     <div class="main-header">
-      <div class="chat-title-display" id="chat-title">Select or start a chat</div>
-      <div class="header-actions" id="header-actions" style="display:none">
-        <button class="header-btn" onclick="showShareModal()">Share</button>
-        <button class="header-btn" onclick="toggleArtifactPanel()">Artifacts</button>
+      <button class="hamburger-btn" id="hamburger-btn" onclick="toggleSidebar()" aria-label="Toggle sidebar">🤖</button>
+      <div class="participants-row" id="participants-row"></div>
+      <!-- Centered title (constrained width) -->
+      <div class="header-title-center">
+        <div class="chat-title-wrap" id="chat-title-wrap" onclick="renameCurrentChat()" title="Rename chat">
+          <div class="chat-title-display" id="chat-title">Select or start a chat</div>
+          <span class="chat-title-edit-icon">✏️</span>
+        </div>
       </div>
-      <button class="header-btn" id="rename-all-btn" onclick="renameAllChats()" title="AI-rename all chats based on their content">✨ Rename All</button>
-      <button class="header-btn" onclick="toggleTheme()" id="theme-toggle-btn" title="Toggle light/dark mode">☀️</button>
-      <button class="header-btn skills-always-btn" onclick="toggleWorkflowsPanel()" id="workflows-toggle-btn">Workflows</button>
-      <button class="header-btn skills-always-btn" onclick="toggleSkillsPanel()" id="skills-toggle-btn">Skills</button>
+      <!-- Right side actions -->
+      <div class="header-right">
+        <!-- New chat in project (context-aware) -->
+        <div id="header-actions" style="display:none">
+          <button class="header-btn new-project-chat-btn" id="new-project-chat-btn" onclick="newChatInCurrentProject()" style="display:none" title="Start a new chat in this project">＋ New chat</button>
+          <!-- Invite dropdown (managed by updateCollabUI) -->
+          <div class="invite-dropdown-wrap" id="invite-dropdown-wrap" style="display:none; position:relative">
+            <button class="collab-btn" id="collab-lock-btn" onclick="toggleInviteDropdown()" title="Invite users to this chat">👥 Invite</button>
+            <div class="invite-dropdown" id="invite-dropdown" style="display:none"></div>
+          </div>
+        </div>
+        <!-- Tools dropdown -->
+        <div class="tools-menu-wrap" id="tools-menu-wrap">
+          <button class="header-btn tools-menu-btn" onclick="toggleToolsMenu()" id="tools-menu-btn">Tools ▾</button>
+          <div class="tools-menu-dropdown" id="tools-menu-dropdown" style="display:none">
+            <button class="tools-menu-item" onclick="showShareModal(); closeToolsMenu()">Share</button>
+            <button class="tools-menu-item" onclick="toggleArtifactPanel(); closeToolsMenu()">Artifacts</button>
+            <button class="tools-menu-item" onclick="toggleWorkflowsPanel(); closeToolsMenu()" id="workflows-toggle-btn">Workflows</button>
+            <button class="tools-menu-item" onclick="toggleSkillsPanel(); closeToolsMenu()" id="skills-toggle-btn">Skills</button>
+            <hr class="tools-menu-divider"/>
+            <button class="tools-menu-item" onclick="renameAllChats(); closeToolsMenu()" id="rename-all-btn">✨ Rename All</button>
+            <button class="tools-menu-item" onclick="toggleTheme(); closeToolsMenu()" id="theme-toggle-btn">🌙 Theme</button>
+          </div>
+        </div>
+        <!-- User avatar -->
+        <div class="user-menu-wrap" id="user-menu-wrap" style="display:none">
+          <button class="user-menu-btn" onclick="toggleUserMenu()" id="user-menu-btn">
+            <span id="user-avatar-initial">A</span>
+          </button>
+          <div class="user-menu-dropdown" id="user-menu-dropdown" style="display:none">
+            <div class="user-menu-email" id="user-menu-email-display"></div>
+            <button class="user-menu-item" id="admin-panel-btn" onclick="showAdminPanel(); toggleUserMenu()" style="display:none">Admin Panel</button>
+            <button class="user-menu-item" onclick="showSettingsModal(); toggleUserMenu()">Settings</button>
+            <button class="user-menu-item logout" onclick="doLogout()">Sign out</button>
+          </div>
+        </div>
+      </div>
     </div>
     <div id="messages-area">
       <div class="empty-state" id="empty-state">
@@ -58,10 +122,12 @@
         <div class="empty-state-text">Start a new chat or select one from the sidebar</div>
       </div>
     </div>
+    <div class="typing-indicator" id="typing-indicator"></div>
     <div id="input-area" style="display:none">
       <div class="input-wrap">
         <div class="input-attachments" id="input-attachments"></div>
         <div class="input-row" id="input-row">
+          <button class="input-btn followup-btn" onclick="sendFollowUp()" title="Follow Up">Follow Up</button>
           <textarea id="msg-input" placeholder="Message your agent..." rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
           <input type="file" id="file-input" multiple style="display:none" onchange="handleFiles(this.files)"/>
           <button class="input-btn" onclick="document.getElementById('file-input').click()" title="Attach file">📎</button>
@@ -132,6 +198,7 @@
   <div class="modal" id="modal-content"></div>
 </div>
 
+<div id="sse-reconnect-indicator"></div>
 <script src="/app.js"></script>
 </body>
 </html>

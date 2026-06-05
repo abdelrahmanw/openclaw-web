@@ -1,3 +1,5 @@
+window.currentUser = null;
+
 // === Theme (dark / light) ===
 function initTheme() {
   const saved = localStorage.getItem('openclaw-theme');
@@ -12,13 +14,13 @@ function applyTheme(mode) {
   const hljsLight = document.getElementById('hljs-light');
   if (mode === 'light') {
     root.classList.add('light');
-    if (btn) btn.textContent = '🌙';
+    if (btn) btn.textContent = '🌙 Dark mode';
     if (hljsDark) hljsDark.disabled = true;
     if (hljsLight) hljsLight.disabled = false;
     localStorage.setItem('openclaw-theme', 'light');
   } else {
     root.classList.remove('light');
-    if (btn) btn.textContent = '☀️';
+    if (btn) btn.textContent = '☀️ Light mode';
     if (hljsDark) hljsDark.disabled = false;
     if (hljsLight) hljsLight.disabled = true;
     localStorage.setItem('openclaw-theme', 'dark');
@@ -28,6 +30,48 @@ function applyTheme(mode) {
 function toggleTheme() {
   const isLight = document.documentElement.classList.contains('light');
   applyTheme(isLight ? 'dark' : 'light');
+}
+
+// === Tools menu ===
+function toggleToolsMenu() {
+  const dd = document.getElementById('tools-menu-dropdown');
+  if (!dd) return;
+  const open = dd.style.display === 'none';
+  if (open) {
+    // For guest users: hide all items except Theme
+    const isGuest = document.documentElement.dataset.guestMode === '1';
+    dd.querySelectorAll('.tools-menu-item, .tools-menu-divider').forEach(el => {
+      if (isGuest) {
+        el.style.display = el.id === 'theme-toggle-btn' ? '' : 'none';
+      } else {
+        el.style.display = '';
+      }
+    });
+  }
+  dd.style.display = open ? 'flex' : 'none';
+}
+function closeToolsMenu() {
+  const dd = document.getElementById('tools-menu-dropdown');
+  if (dd) dd.style.display = 'none';
+}
+document.addEventListener('click', (e) => {
+  const wrap = document.getElementById('tools-menu-wrap');
+  if (wrap && !wrap.contains(e.target)) closeToolsMenu();
+});
+
+// === Mobile sidebar toggle ===
+function toggleSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  const overlay = document.getElementById('sidebar-overlay');
+  const open = sidebar.classList.toggle('open');
+  if (overlay) overlay.classList.toggle('active', open);
+}
+function closeSidebarMobile() {
+  if (window.innerWidth > 768) return;
+  const sidebar = document.getElementById('sidebar');
+  const overlay = document.getElementById('sidebar-overlay');
+  sidebar.classList.remove('open');
+  if (overlay) overlay.classList.remove('active');
 }
 
 // === Ding sound (Web Audio API) ===
@@ -102,8 +146,14 @@ let state = {
   projects: [],
   // Multi-chat background polling: { [chatId]: { aiMsgId, interval } }
   pendingPolls: {},
+  // Server-reported agent busy status per chat (synced via SSE)
+  chatAgentBusy: {}, // { [chatId]: bool }
+  chatThinkingMsgId: {}, // { [chatId]: string|null } — the specific aiMsgId currently in-flight
+  // Server-reported shared queue per chat (synced via SSE)
+  chatSharedQueue: {}, // { [chatId]: Array<{id, senderName, preview, enqueuedAt}> }
   pendingFiles: [],
   messageQueue: {}, // keyed by chatId: { [chatId]: [] }
+  drafts: JSON.parse(localStorage.getItem('openclaw-drafts') || '{}'),
   artifacts: [],
   currentArtifactIdx: 0,
   mediaRecorder: null,
@@ -126,12 +176,46 @@ window.addEventListener('DOMContentLoaded', async () => {
     const loginName = document.getElementById('login-instance-name');
     if (loginName) loginName.textContent = name;
   } catch (e) { /* keep defaults */ }
+  // Handle /reset-password SPA route
+  if (window.location.pathname === '/reset-password') {
+    document.getElementById('reset-password-screen').style.display = 'flex';
+    setupMarked();
+    return;
+  }
+  // Handle /admin SPA route
+  if (window.location.pathname === '/admin') {
+    const res2 = await api('/api/me');
+    if (res2.authenticated && (res2.user?.role === 'admin' || res2.user?.role === 'accord')) {
+      state.authenticated = true;
+      window.currentUser = res2.user;
+      setupMarked();
+      showAdminPanel();
+      return;
+    } else {
+      window.location.href = '/';
+      return;
+    }
+  }
+
   const res = await api('/api/me');
   if (res.authenticated) {
     state.authenticated = true;
+    window.currentUser = res.user || null;
+    if (window.currentUser) setupUserMenu(window.currentUser);
     showApp();
   } else {
-    document.getElementById('login-screen').style.display = 'flex';
+    // Check for ?reset=1 success message
+    const params = new URLSearchParams(window.location.search);
+    const loginScreen = document.getElementById('login-screen');
+    loginScreen.style.display = 'flex';
+    if (params.get('reset') === '1') {
+      const errEl = document.getElementById('login-error');
+      if (errEl) {
+        errEl.style.display = 'block';
+        errEl.style.color = '#6ee7b7';
+        errEl.textContent = 'Password reset successfully. Please sign in.';
+      }
+    }
   }
   setupDragDrop();
   setupMarked();
@@ -161,21 +245,149 @@ function setupMarked() {
 
 // === Auth ===
 async function doLogin() {
-  const pw = document.getElementById('login-pw').value;
-  const err = document.getElementById('login-error');
+  const email = (document.getElementById('login-email')?.value || '').trim();
+  const password = document.getElementById('login-pw').value;
+  const rememberMe = !!(document.getElementById('login-remember')?.checked);
+  const errEl = document.getElementById('login-error');
+  errEl.style.display = 'none';
   try {
-    const res = await api('/api/login', 'POST', { password: pw });
-    if (res.ok) {
-      err.style.display = 'none';
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, rememberMe })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      window.currentUser = data.user;
       document.getElementById('login-screen').style.display = 'none';
+      document.getElementById('app').style.display = 'flex';
       state.authenticated = true;
+      setupUserMenu(data.user);
       showApp();
+    } else {
+      errEl.textContent = data.error || 'Login failed';
+      errEl.style.display = 'block';
     }
-  } catch(e) {
-    err.textContent = 'Wrong password';
-    err.style.display = 'block';
+  } catch (e) {
+    errEl.textContent = 'Network error';
+    errEl.style.display = 'block';
   }
 }
+
+async function doLogout() {
+  await fetch('/api/auth/logout', { method: 'POST' });
+  window.currentUser = null;
+  window.location.reload();
+}
+
+function showForgotForm() {
+  document.getElementById('login-form-view').style.display = 'none';
+  document.getElementById('forgot-form-view').style.display = 'block';
+}
+function showLoginForm() {
+  document.getElementById('forgot-form-view').style.display = 'none';
+  document.getElementById('login-form-view').style.display = 'block';
+}
+async function doForgotPassword() {
+  const email = document.getElementById('forgot-email').value.trim();
+  const msg = document.getElementById('forgot-msg');
+  msg.style.display = 'none';
+  await fetch('/api/auth/forgot-password', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ email }) });
+  msg.style.display = 'block';
+  msg.style.color = '#6ee7b7';
+  msg.textContent = 'If that email exists, a reset link has been sent.';
+}
+async function doResetPassword() {
+  const token = new URLSearchParams(window.location.search).get('token');
+  const pw = document.getElementById('reset-pw').value;
+  const pw2 = document.getElementById('reset-pw2').value;
+  const msg = document.getElementById('reset-msg');
+  msg.style.display = 'none';
+  if (pw !== pw2) { msg.style.display='block'; msg.textContent='Passwords do not match'; return; }
+  if (pw.length < 8) { msg.style.display='block'; msg.textContent='Minimum 8 characters'; return; }
+  const res = await fetch('/api/auth/reset-password', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ token, password: pw }) });
+  const data = await res.json();
+  if (data.ok) {
+    window.location.href = '/?reset=1';
+  } else {
+    msg.style.display='block'; msg.textContent = data.error || 'Error resetting password';
+  }
+}
+function setupUserMenu(user) {
+  if (!user) return;
+  const wrap = document.getElementById('user-menu-wrap');
+  if (wrap) wrap.style.display = 'block';
+  const initial = document.getElementById('user-avatar-initial');
+  if (initial) initial.textContent = (user.display_name || user.email || 'A')[0].toUpperCase();
+  const emailEl = document.getElementById('user-menu-email-display');
+  if (emailEl) emailEl.textContent = user.email || '';
+  // Show Admin Panel link for admin and accord users
+  const adminBtn = document.getElementById('admin-panel-btn');
+  if (adminBtn && (user.role === 'admin' || user.role === 'accord')) {
+    adminBtn.style.display = 'block';
+  }
+  // Guest restrictions
+  if (user.role === 'guest') {
+    applyGuestUI();
+  }
+}
+
+function applyGuestUI() {
+  // Hide sidebar "+ New Chat" button (guests can't create project-less chats)
+  const newChatBtn = document.querySelector('.new-chat-btn');
+  if (newChatBtn) newChatBtn.style.display = 'none';
+  // Tools menu: hide all items except Theme
+  // We flag this so toggleToolsMenu can re-apply it after DOM changes
+  document.documentElement.dataset.guestMode = '1';
+}
+function toggleUserMenu() {
+  const dd = document.getElementById('user-menu-dropdown');
+  if (dd) dd.style.display = dd.style.display === 'none' ? 'block' : 'none';
+}
+async function showSettingsModal() {
+  const user = window.currentUser || {};
+  showModal(`
+    <h3 style="margin:0 0 16px">Settings</h3>
+    <label style="display:block;margin-bottom:4px;font-size:13px;opacity:.7">Display name</label>
+    <input type="text" id="settings-display-name" class="modal-input" value="${(user.display_name || '').replace(/"/g,'&quot;')}" placeholder="Display name" style="width:100%;margin-bottom:12px"/>
+    <button class="modal-btn primary" onclick="saveDisplayName()">Save name</button>
+    <hr style="margin:16px 0;opacity:.2"/>
+    <label style="display:block;margin-bottom:4px;font-size:13px;opacity:.7">Change password</label>
+    <input type="password" id="settings-current-pw" class="modal-input" placeholder="Current password" style="width:100%;margin-bottom:8px"/>
+    <input type="password" id="settings-new-pw" class="modal-input" placeholder="New password (min 8)" style="width:100%;margin-bottom:8px"/>
+    <input type="password" id="settings-new-pw2" class="modal-input" placeholder="Confirm new password" style="width:100%;margin-bottom:12px"/>
+    <button class="modal-btn primary" onclick="saveNewPassword()">Change password</button>
+    <div id="settings-msg" style="margin-top:8px;font-size:13px;display:none"></div>
+  `);
+}
+async function saveDisplayName() {
+  const name = document.getElementById('settings-display-name').value.trim();
+  const msg = document.getElementById('settings-msg');
+  const res = await fetch('/api/settings/profile', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ display_name: name }) });
+  const data = await res.json();
+  msg.style.display = 'block';
+  if (data.ok) {
+    msg.style.color = '#6ee7b7'; msg.textContent = 'Name updated!';
+    if (window.currentUser) window.currentUser.display_name = name;
+    const initial = document.getElementById('user-avatar-initial');
+    if (initial) initial.textContent = (name || 'A')[0].toUpperCase();
+  } else { msg.style.color = '#f87171'; msg.textContent = data.error || 'Error'; }
+}
+async function saveNewPassword() {
+  const curr = document.getElementById('settings-current-pw').value;
+  const np = document.getElementById('settings-new-pw').value;
+  const np2 = document.getElementById('settings-new-pw2').value;
+  const msg = document.getElementById('settings-msg');
+  msg.style.display = 'none';
+  if (np !== np2) { msg.style.display='block'; msg.style.color='#f87171'; msg.textContent='Passwords do not match'; return; }
+  if (np.length < 8) { msg.style.display='block'; msg.style.color='#f87171'; msg.textContent='Min 8 characters'; return; }
+  const res = await fetch('/api/settings/password', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ current_password: curr, new_password: np }) });
+  const data = await res.json();
+  msg.style.display = 'block';
+  if (data.ok) { msg.style.color='#6ee7b7'; msg.textContent='Password updated!'; }
+  else { msg.style.color='#f87171'; msg.textContent=data.error||'Error'; }
+}
+
 document.addEventListener('keydown', e => {
   if (e.key === 'Enter' && document.getElementById('login-screen').style.display !== 'none') {
     doLogin();
@@ -227,6 +439,9 @@ function pushProjectURL(proj) {
 
 function routeFromURL() {
   const path = location.pathname;
+  // /join/:token (Phase 3)
+  const joinMatch = path.match(/^\/join\/([^/]+)$/);
+  if (joinMatch) { handleJoinRoute(); return; }
   // /chat/:chatId
   const chatMatch = path.match(/^\/chat\/([\w-]+)$/);
   if (chatMatch) { openChat(chatMatch[1]); return; }
@@ -307,6 +522,7 @@ function markChatReplied(chatId) {
 function chatItemHTML(c, proj) {
   const active = state.currentChat?.id === c.id ? 'active' : '';
   const hasUnread = unreadReplies.has(c.id) && state.currentChat?.id !== c.id;
+  const hasDraft = !!(state.drafts[c.id] && state.currentChat?.id !== c.id);
   let titleHTML;
   if (proj) {
     titleHTML = `<span class="chat-item-title"><span class="chat-item-project-name" onclick="event.stopPropagation();openProject('${proj.id}')">${esc(proj.name)}</span><span class="chat-item-sep"> / </span>${esc(c.title)}</span>`;
@@ -314,10 +530,12 @@ function chatItemHTML(c, proj) {
     titleHTML = `<span class="chat-item-title">${esc(c.title)}</span>`;
   }
   const badge = hasUnread ? `<span class="new-reply-badge">new</span>` : '';
+  const draftBadge = hasDraft ? `<span class="chat-draft-badge">draft</span>` : '';
   return `<div class="chat-item ${active}" onclick="openChat('${c.id}')" data-id="${c.id}">
     <span style="font-size:14px">💬</span>
     ${titleHTML}
     ${badge}
+    ${draftBadge}
     <div class="chat-item-actions">
       <button class="action-btn" onclick="event.stopPropagation();moveChatToProject('${c.id}')" title="Move to project">📁</button>
       <button class="action-btn" onclick="event.stopPropagation();renameChat('${c.id}')" title="Rename">✏️</button>
@@ -343,8 +561,9 @@ function renderProjects(el) {
         <span style="font-size:14px">📁</span>
         <span class="project-item-name" onclick="openProject('${p.id}')">${esc(p.name)}</span>
         <div class="project-item-actions">
-          <button class="action-btn" onclick="event.stopPropagation();editProject('${p.id}')" title="Edit">✏️</button>
-          <button class="action-btn" onclick="event.stopPropagation();deleteProject('${p.id}')" title="Delete">🗑</button>
+          ${(window.currentUser?.role === 'admin' || window.currentUser?.role === 'accord') ? `<button class="action-btn" onclick="event.stopPropagation();showProjectSettings('${p.id}')" title="Project Settings">⚙️</button>` : ''}
+          ${window.currentUser?.role !== 'guest' ? `<button class="action-btn" onclick="event.stopPropagation();editProject('${p.id}')" title="Edit">✏️</button>` : ''}
+          ${window.currentUser?.role !== 'guest' ? `<button class="action-btn" onclick="event.stopPropagation();deleteProject('${p.id}')" title="Delete">🗑</button>` : ''}
         </div>
       </div>
       ${!isCollapsed ? `<div class="project-chat-indent">${
@@ -517,6 +736,24 @@ function getChatDisplayTitleHTML(chat) {
 }
 
 async function openChat(id) {
+  closeSidebarMobile();
+  // Save draft for the chat we're leaving
+  const leavingChatId = state.currentChat?.id;
+  if (leavingChatId && leavingChatId !== id) {
+    const inputEl = document.getElementById('msg-input');
+    const draftText = inputEl ? inputEl.value : '';
+    if (draftText.trim()) {
+      state.drafts[leavingChatId] = draftText;
+    } else {
+      delete state.drafts[leavingChatId];
+    }
+    localStorage.setItem('openclaw-drafts', JSON.stringify(state.drafts));
+    // Clear the input immediately so it doesn't bleed into the new chat
+    if (inputEl) { inputEl.value = ''; autoResize(inputEl); }
+  }
+  // Clear typing indicator from previous chat
+  const typingEl = document.getElementById('typing-indicator');
+  if (typingEl) typingEl.innerHTML = '';
   // Don't kill polls — background chats keep running
   // Only stop the thinking cycle for the view; polls continue in the background
   stopThinkingCycle();
@@ -537,6 +774,8 @@ async function openChat(id) {
   document.getElementById('chat-title').innerHTML = getChatDisplayTitleHTML(state.currentChat);
   document.getElementById('header-actions').style.display = 'flex';
   document.getElementById('input-area').style.display = 'block';
+  const titleWrap = document.getElementById('chat-title-wrap');
+  if (titleWrap) titleWrap.style.cursor = 'pointer';
   // Bump sort order when user opens a chat
   api(`/api/chats/${state.currentChat.id}/touch`, 'POST').catch(() => {});
   // Update queue display for the newly-selected chat
@@ -544,9 +783,24 @@ async function openChat(id) {
   // Clear messages immediately — prevents stale content flashing before fetch completes
   document.getElementById('messages-area').innerHTML = '';
   await loadMessages();
-  // Auto-focus the input so the user can start typing immediately
+  // Connect SSE stream for this chat (Phase 3)
+  connectChatSSE(state.currentChat.id);
+  // Sync agent status from server (so non-senders see correct thinking state)
+  syncAgentStatus(state.currentChat.id);
+  // Update collab UI (Phase 3)
+  updateCollabUI();
+  // Show/hide "+ New chat in [Project]" button
+  updateProjectChatBtn();
+  // Restore draft for this chat
   const msgInput = document.getElementById('msg-input');
-  if (msgInput) msgInput.focus();
+  if (msgInput) {
+    const savedDraft = state.drafts[id] || '';
+    msgInput.value = savedDraft;
+    autoResize(msgInput);
+    msgInput.focus();
+    // Position cursor at end of restored draft
+    if (savedDraft) msgInput.setSelectionRange(savedDraft.length, savedDraft.length);
+  }
 }
 
 async function loadMessages() {
@@ -600,14 +854,80 @@ function formatTimestamp(ts) {
 
 function renderMessage(msg) {
   const isUser = msg.role === 'user';
-  const avatar = isUser ? 'A' : '🤖';
+
+  // Phase 4: system messages for approval flow
+  if (msg.role === 'system') {
+    const reqMatch = msg.content.match(/^\[APPROVAL_REQUEST:([^\]]+)\]$/);
+    const resMatch = msg.content.match(/^\[APPROVAL_RESULT:([^:]+):(approved|denied)\]$/);
+    const msgId = msg.id || ('sys-' + Math.random().toString(36).slice(2));
+
+    if (reqMatch) {
+      const approvalId = reqMatch[1];
+      // Render placeholder, then async-fill it
+      setTimeout(() => {
+        const el = document.querySelector(`[data-sys-id="${msgId}"] .approval-placeholder`);
+        if (el) renderApprovalCard(approvalId, el);
+      }, 0);
+      return `<div class="message system" data-id="${msg.id}" data-sys-id="${msgId}">
+        <div class="avatar-col"><div class="message-avatar" style="font-size:18px">🔐</div></div>
+        <div class="message-content"><div class="approval-placeholder"><div style="color:var(--text-muted);font-size:13px">Loading request...</div></div></div>
+      </div>`;
+    }
+
+    if (resMatch) {
+      const approvalId = resMatch[1];
+      const status = resMatch[2];
+      const cardClass = status === 'approved' ? 'approved' : 'denied';
+      const badge = status === 'approved'
+        ? `<div class="approval-status-badge approved">✅ Approved</div>`
+        : `<div class="approval-status-badge denied">❌ Denied</div>`;
+      // Async-load name
+      setTimeout(() => {
+        const el = document.querySelector(`[data-sys-id="${msgId}"] .approval-placeholder`);
+        if (el) {
+          api(`/api/approvals/${approvalId}`).then(approval => {
+            el.innerHTML = `<div class="approval-card ${cardClass}" data-approval-id="${esc(approvalId)}">
+              <div class="approval-card-title">🔐 Permission Request</div>
+              <div class="approval-card-sub">${esc(approval.guest_display_name)} — <strong>${esc(approval.action_name)}</strong></div>
+              ${badge}
+            </div>`;
+          }).catch(() => {
+            el.innerHTML = `<div class="approval-card ${cardClass}">
+              <div class="approval-card-title">🔐 Permission Request</div>
+              ${badge}
+            </div>`;
+          });
+        }
+      }, 0);
+      return `<div class="message system" data-id="${msg.id}" data-sys-id="${msgId}">
+        <div class="avatar-col"><div class="message-avatar" style="font-size:18px">🔐</div></div>
+        <div class="message-content"><div class="approval-placeholder"><div style="color:var(--text-muted);font-size:13px">Loading...</div></div></div>
+      </div>`;
+    }
+
+    // Generic system message
+    return `<div class="message system" data-id="${msg.id}">
+      <div class="avatar-col"><div class="message-avatar" style="font-size:18px">ℹ️</div></div>
+      <div class="message-content"><div class="message-bubble" style="font-size:13px;color:var(--text-muted)">${esc(msg.content)}</div></div>
+    </div>`;
+  }
+
+  // In collaborative chats, show the sender's initial instead of generic 'A'
+  const senderInitial = msg.display_name ? msg.display_name.charAt(0).toUpperCase() : 'A';
+  const avatar = isUser ? senderInitial : '🤖';
+  const avatarColor = isUser && msg.display_name ? getAvatarColor(msg.display_name) : null;
   const thinking = msg.content === '...thinking...';
 
   let content = '';
   if (thinking) {
-    // Show live thinking animation if we are actively polling for this message in any chat
+    // Show live thinking animation if:
+    // - we have a local pending poll for this message, OR
+    // - the server reports the agent is busy in this chat (handles other users' view)
     const chatPoll = Object.values(state.pendingPolls).find(p => p.aiMsgId === msg.id);
-    const isActivePoll = !!chatPoll;
+    const chatId = state.currentChat?.id;
+    // Only animate THIS specific message if the server is working on it
+    const serverActiveForThisMsg = chatId && state.chatThinkingMsgId[chatId] === msg.id;
+    const isActivePoll = !!chatPoll || serverActiveForThisMsg;
     if (isActivePoll) {
       const thinkingText = THINKING_MSGS[thinkingMsgIdx] || 'Working on it…';
       content = `<div class="message-bubble thinking"><span class="spinner"></span> <span class="thinking-label">${thinkingText}</span></div>`;
@@ -648,9 +968,21 @@ function renderMessage(msg) {
        </div>`
     : '';
 
+  // Show sender label in collaborative chats (when display_name present and not current user)
+  const senderLabel = (isUser && msg.display_name && msg.display_name !== window.currentUser?.display_name)
+    ? `<div class="message-sender-label">${esc(msg.display_name)}</div>` : '';
+  const avatarStyle = avatarColor ? ` style="background:${avatarColor}"` : '';
+
+  // Name shown under avatar: use display_name for user messages
+  const avatarName = isUser ? (msg.display_name || window.currentUser?.display_name || '') : '';
+  const avatarNameHTML = avatarName ? `<div class="avatar-name">${esc(avatarName)}</div>` : '';
+
   return `<div class="message ${msg.role}" data-id="${msg.id}">
-    <div class="message-avatar">${avatar}</div>
-    <div class="message-content">${atts}${content}${actionsHTML}${tsHTML}</div>
+    <div class="avatar-col">
+      <div class="message-avatar coloured"${avatarStyle}>${avatar}</div>
+      ${avatarNameHTML}
+    </div>
+    <div class="message-content">${senderLabel}${atts}${content}${actionsHTML}${tsHTML}</div>
   </div>`;
 }
 
@@ -708,6 +1040,10 @@ async function sendMessage() {
 
   clearPollInterval(chatId);
 
+  // Clear draft on send
+  delete state.drafts[chatId];
+  localStorage.setItem('openclaw-drafts', JSON.stringify(state.drafts));
+
   const btn = document.getElementById('send-btn');
   btn.disabled = true;
   input.value = ''; autoResize(input);
@@ -732,6 +1068,7 @@ async function sendMessage() {
 
 // Legacy poll fallback (used for file uploads and SSE errors)
 function startLegacyPoll(chatId, aiMsgId) {
+  state.chatThinkingMsgId[chatId] = aiMsgId; // track which message is in-flight
   startThinkingCycle();
   const interval = setInterval(async () => {
     if (!state.pendingPolls[chatId]) return;
@@ -781,6 +1118,7 @@ function clearPollInterval(chatId) {
       // Legacy poll: clear interval
       if (p.interval) clearInterval(p.interval);
       delete state.pendingPolls[chatId];
+      state.chatThinkingMsgId[chatId] = null; // clear in-flight tracking
     }
     if (state.currentChat?.id === chatId) updateStopBtn(chatId);
   } else {
@@ -798,14 +1136,49 @@ function hasPendingPoll(chatId) {
   return !!state.pendingPolls[chatId];
 }
 
+function sendFollowUp() {
+  const input = document.getElementById('msg-input');
+  input.value = 'Done? if yes, resend last message';
+  autoResize(input);
+  sendMessage();
+}
+
 function handleKey(e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); return; }
+  // Fire typing ping for collaborative chats (Phase 3)
+  if (state.currentChat) pingTyping(state.currentChat.id);
 }
 
 function autoResize(el) {
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, 150) + 'px';
 }
+
+// === Per-chat draft persistence ===
+// Wires up a live input listener on #msg-input so the current draft is always saved
+(function setupDraftListener() {
+  let _draftSaveTimer = null;
+  document.addEventListener('DOMContentLoaded', () => {
+    const inputEl = document.getElementById('msg-input');
+    if (!inputEl) return;
+    inputEl.addEventListener('input', () => {
+      const chatId = state.currentChat?.id;
+      if (!chatId) return;
+      const text = inputEl.value;
+      if (text.trim()) {
+        state.drafts[chatId] = text;
+      } else {
+        delete state.drafts[chatId];
+      }
+      // Debounce localStorage write
+      clearTimeout(_draftSaveTimer);
+      _draftSaveTimer = setTimeout(() => {
+        localStorage.setItem('openclaw-drafts', JSON.stringify(state.drafts));
+        renderSidebar(); // update draft badges
+      }, 300);
+    });
+  });
+})();
 
 function scrollToBottom() {
   const area = document.getElementById('messages-area');
@@ -1154,17 +1527,30 @@ async function renderProjectPage(project) {
   const area = document.getElementById('messages-area');
   area.innerHTML = `<div class="project-page"><div class="project-page-spinner">Loading...</div></div>`;
 
-  // Load files and chats in parallel
-  let files = [], chats = [];
+  const isAdminOrAccord = window.currentUser?.role === 'admin' || window.currentUser?.role === 'accord';
+
+  // Load files, links, chats (and members for admin/accord) in parallel
+  let files = [], links = [], chats = [], members = [], allUsers = [];
   try {
-    [files, chats] = await Promise.all([
+    const base = [
       api(`/api/projects/${project.id}/files`),
+      api(`/api/projects/${project.id}/links`),
       api(`/api/chats?project_id=${project.id}`),
-    ]);
+    ];
+    if (isAdminOrAccord) {
+      base.push(api(`/api/projects/${project.id}/members`));
+      base.push(api('/api/admin/users'));
+    }
+    const results = await Promise.all(base);
+    [files, links, chats] = results;
+    if (isAdminOrAccord) { members = results[3]; allUsers = results[4]; }
   } catch (e) {
     area.innerHTML = `<div class="project-page"><p style="color:var(--danger)">Failed to load project: ${esc(e.message)}</p></div>`;
     return;
   }
+
+  const LINK_ICONS = { doc: '📝', sheet: '📊', slide: '📑', folder: '📁' };
+  const LINK_LABELS = { doc: 'Google Doc', sheet: 'Google Sheet', slide: 'Google Slides', folder: 'Drive Folder' };
 
   const filesHTML = files.map(f => {
     const size = f.size > 1024 * 1024
@@ -1175,6 +1561,17 @@ async function renderProjectPage(project) {
       <span class="project-file-name">${esc(f.name)}</span>
       <span class="project-file-size">${size}</span>
       <button class="action-btn" onclick="deleteProjectFile('${project.id}','${f.id}')" title="Delete">🗑</button>
+    </div>`;
+  }).join('');
+
+  const linksHTML = links.map(l => {
+    const icon = LINK_ICONS[l.link_type] || '🔗';
+    const label = LINK_LABELS[l.link_type] || 'Link';
+    return `<div class="project-file-item" data-id="${l.id}">
+      <span class="project-file-icon">${icon}</span>
+      <a class="project-file-name project-link-name" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.title)}</a>
+      <span class="project-file-size" style="color:var(--text-muted)">${label}</span>
+      <button class="action-btn" onclick="deleteProjectLink('${project.id}','${l.id}')" title="Remove">🗑</button>
     </div>`;
   }).join('');
 
@@ -1191,14 +1588,24 @@ async function renderProjectPage(project) {
       <div class="project-page-header">
         <div class="project-page-title">${esc(project.name)}</div>
         <div class="project-page-header-actions">
-          <button class="modal-btn secondary" onclick="editProject('${project.id}')">✏️ Edit</button>
-          <button class="modal-btn secondary" style="color:var(--danger)" onclick="deleteProjectFromPage('${project.id}')">🗑 Delete</button>
+          ${window.currentUser?.role !== 'guest' ? `<button class="modal-btn secondary" onclick="editProject('${project.id}')">✏️ Edit</button>` : ''}
+          ${window.currentUser?.role !== 'guest' ? `<button class="modal-btn secondary" style="color:var(--danger)" onclick="deleteProjectFromPage('${project.id}')">🗑 Delete</button>` : ''}
         </div>
       </div>
 
       <div class="project-page-section">
         <div class="project-section-title">Instructions</div>
         <div class="project-instructions-text">${project.instructions ? esc(project.instructions).replace(/\n/g,'<br>') : '<span style="color:var(--text-muted)">No instructions set. Click Edit to add context for AI.</span>'}</div>
+      </div>
+
+      <div class="project-page-section">
+        <div class="project-section-title" style="display:flex;align-items:center;justify-content:space-between">
+          <span>Links <span style="color:var(--text-muted);font-size:12px;font-weight:400">(Google Docs, Sheets, Slides, Drive folders)</span></span>
+          <button class="modal-btn secondary" style="font-size:12px;padding:5px 10px" onclick="showAddLinkModal('${project.id}')">+ Add Link</button>
+        </div>
+        <div class="project-files-list" id="proj-links-${project.id}">
+          ${linksHTML || '<div class="project-files-empty">No links yet</div>'}
+        </div>
       </div>
 
       <div class="project-page-section">
@@ -1220,8 +1627,136 @@ async function renderProjectPage(project) {
           ${chatsHTML || '<div class="project-files-empty">No chats yet. Start one above.</div>'}
         </div>
       </div>
+
+      ${isAdminOrAccord ? `
+      <div class="project-page-section" id="proj-members-section-${project.id}">
+        <div class="project-section-title" style="display:flex;align-items:center;justify-content:space-between">
+          <span>Members <span style="color:var(--text-muted);font-size:12px;font-weight:400">(who can access this project)</span></span>
+          <button class="modal-btn primary" style="font-size:12px;padding:6px 12px" onclick="showInviteToProject('${project.id}')">+ Invite</button>
+        </div>
+        <div id="proj-members-list-${project.id}">
+          ${renderMembersHTML(members, project.id)}
+        </div>
+        <div id="proj-invite-form-${project.id}" style="display:none;margin-top:12px;padding:14px;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+          <div style="font-weight:600;font-size:13px;margin-bottom:10px">Invite guest to this project</div>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <input class="modal-input" id="proj-invite-email-${project.id}" placeholder="Email address" type="email" style="margin:0"/>
+            <input class="modal-input" id="proj-invite-name-${project.id}" placeholder="Display name (optional)" style="margin:0"/>
+            <div style="display:flex;gap:8px">
+              <select id="proj-invite-existing-${project.id}" style="flex:1;padding:8px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px">
+                <option value="">-- Or add existing user --</option>
+                ${allUsers.filter(u => !members.find(m => m.id === u.id)).map(u => `<option value="${u.id}">${esc(u.email)} (${u.role})</option>`).join('')}
+              </select>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:2px">
+              <button class="modal-btn primary" style="flex:1" onclick="submitProjectInvite('${project.id}')">Send Invite</button>
+              <button class="modal-btn secondary" onclick="hideInviteForm('${project.id}')">Cancel</button>
+            </div>
+            <div id="proj-invite-msg-${project.id}" style="font-size:12px;margin-top:2px"></div>
+          </div>
+        </div>
+      </div>
+      ` : ''}
     </div>
   `;
+}
+
+function renderMembersHTML(members, projectId) {
+  if (!members || members.length === 0) {
+    return '<div class="project-files-empty">No members assigned yet.</div>';
+  }
+  return members.map(m => `
+    <div class="project-member-item" data-id="${m.id}">
+      <span class="project-member-avatar">${esc((m.display_name||m.email)[0].toUpperCase())}</span>
+      <span class="project-member-info">
+        <span class="project-member-name">${esc(m.display_name || m.email)}</span>
+        <span class="project-member-email">${esc(m.email)}</span>
+      </span>
+      <span class="role-badge ${m.role}">${m.role}</span>
+      <button class="action-btn" style="color:var(--danger)" onclick="removeProjectMemberFromPage('${projectId}','${m.id}')" title="Remove">✕</button>
+    </div>
+  `).join('');
+}
+
+function showInviteToProject(projectId) {
+  const form = document.getElementById(`proj-invite-form-${projectId}`);
+  if (form) form.style.display = 'block';
+  document.getElementById(`proj-invite-email-${projectId}`)?.focus();
+}
+
+function hideInviteForm(projectId) {
+  const form = document.getElementById(`proj-invite-form-${projectId}`);
+  if (form) form.style.display = 'none';
+}
+
+async function submitProjectInvite(projectId) {
+  const msg = document.getElementById(`proj-invite-msg-${projectId}`);
+  const emailEl = document.getElementById(`proj-invite-email-${projectId}`);
+  const nameEl = document.getElementById(`proj-invite-name-${projectId}`);
+  const existingEl = document.getElementById(`proj-invite-existing-${projectId}`);
+
+  const existingUserId = existingEl?.value;
+  const email = emailEl?.value?.trim();
+  const displayName = nameEl?.value?.trim();
+
+  msg.style.color = 'var(--text-muted)';
+  msg.textContent = 'Saving...';
+
+  try {
+    if (existingUserId) {
+      // Add existing user to project
+      const res = await fetch('/api/admin/project-access', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: projectId, user_id: existingUserId })
+      });
+      const data = await res.json();
+      if (!data.ok) { msg.style.color = 'var(--danger)'; msg.textContent = data.error || 'Error'; return; }
+      msg.style.color = '#4ade80'; msg.textContent = '✓ Access granted';
+    } else if (email) {
+      // Invite new or existing user by email
+      const res = await fetch(`/api/projects/${projectId}/invite-guest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, display_name: displayName, role: 'guest' })
+      });
+      const data = await res.json();
+      if (!data.ok) { msg.style.color = 'var(--danger)'; msg.textContent = data.error || 'Error'; return; }
+      msg.style.color = '#4ade80';
+      msg.textContent = data.isNew ? `✓ Invited ${email} — credentials emailed` : `✓ ${email} added to project`;
+    } else {
+      msg.style.color = 'var(--danger)'; msg.textContent = 'Enter an email or select an existing user';
+      return;
+    }
+
+    // Refresh members list
+    setTimeout(async () => {
+      const updated = await api(`/api/projects/${projectId}/members`).catch(() => null);
+      if (updated) {
+        const listEl = document.getElementById(`proj-members-list-${projectId}`);
+        if (listEl) listEl.innerHTML = renderMembersHTML(updated, projectId);
+      }
+      hideInviteForm(projectId);
+      if (emailEl) emailEl.value = '';
+      if (nameEl) nameEl.value = '';
+      if (existingEl) existingEl.value = '';
+    }, 1200);
+  } catch (e) {
+    msg.style.color = 'var(--danger)'; msg.textContent = e.message;
+  }
+}
+
+async function removeProjectMemberFromPage(projectId, userId) {
+  if (!confirm('Remove this member from the project?')) return;
+  try {
+    const res = await fetch(`/api/admin/project-access/${projectId}/${userId}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (data.ok) {
+      const updated = await api(`/api/projects/${projectId}/members`).catch(() => []);
+      const listEl = document.getElementById(`proj-members-list-${projectId}`);
+      if (listEl) listEl.innerHTML = renderMembersHTML(updated, projectId);
+    }
+  } catch (e) { console.error('removeProjectMemberFromPage:', e.message); }
 }
 
 async function deleteProjectFromPage(id) {
@@ -1261,6 +1796,80 @@ async function uploadProjectFiles(projectId, files) {
 async function deleteProjectFile(projectId, fileId) {
   if (!confirm('Remove this file from the project?')) return;
   await api(`/api/projects/${projectId}/files/${fileId}`, 'DELETE');
+  const project = state.projects.find(p => p.id === projectId);
+  if (project) await renderProjectPage(project);
+}
+
+function detectLinkType(url) {
+  if (/docs\.google\.com\/spreadsheets/.test(url)) return 'sheet';
+  if (/docs\.google\.com\/presentation/.test(url)) return 'slide';
+  if (/drive\.google\.com\/drive/.test(url)) return 'folder';
+  if (/docs\.google\.com\/document/.test(url)) return 'doc';
+  return 'doc';
+}
+
+function showAddLinkModal(projectId) {
+  showModal(`
+    <h3>Add Google Link</h3>
+    <p style="font-size:13px;color:var(--text-muted);margin-bottom:16px">Paste a Google Doc, Sheet, Slides, or Drive folder link. It will be included as context in every chat in this project.</p>
+    <div style="margin-bottom:12px">
+      <label style="display:block;font-size:12px;color:var(--text-muted);margin-bottom:4px">URL</label>
+      <input id="add-link-url" type="url" placeholder="https://docs.google.com/..." style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text);font-size:14px;outline:none" oninput="autoDetectLinkType(this.value)">
+    </div>
+    <div style="margin-bottom:12px">
+      <label style="display:block;font-size:12px;color:var(--text-muted);margin-bottom:4px">Name / Label</label>
+      <input id="add-link-title" type="text" placeholder="e.g. Q2 Roadmap" style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text);font-size:14px;outline:none">
+    </div>
+    <div style="margin-bottom:20px">
+      <label style="display:block;font-size:12px;color:var(--text-muted);margin-bottom:6px">Type</label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <label id="lt-doc" class="link-type-chip active" onclick="selectLinkType('doc')"><input type="radio" name="link_type" value="doc" checked style="display:none">📝 Doc</label>
+        <label id="lt-sheet" class="link-type-chip" onclick="selectLinkType('sheet')"><input type="radio" name="link_type" value="sheet" style="display:none">📊 Sheet</label>
+        <label id="lt-slide" class="link-type-chip" onclick="selectLinkType('slide')"><input type="radio" name="link_type" value="slide" style="display:none">📑 Slides</label>
+        <label id="lt-folder" class="link-type-chip" onclick="selectLinkType('folder')"><input type="radio" name="link_type" value="folder" style="display:none">📁 Folder</label>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="modal-btn secondary" onclick="closeModal()">Cancel</button>
+      <button class="modal-btn primary" onclick="addProjectLink('${projectId}')">Add Link</button>
+    </div>
+  `);
+}
+
+function selectLinkType(type) {
+  ['doc','sheet','slide','folder'].forEach(t => {
+    const el = document.getElementById(`lt-${t}`);
+    if (el) el.classList.toggle('active', t === type);
+    const radio = el && el.querySelector('input[type=radio]');
+    if (radio) radio.checked = (t === type);
+  });
+}
+
+function autoDetectLinkType(url) {
+  if (!url) return;
+  const detected = detectLinkType(url);
+  selectLinkType(detected);
+}
+
+async function addProjectLink(projectId) {
+  const url = document.getElementById('add-link-url')?.value?.trim();
+  const title = document.getElementById('add-link-title')?.value?.trim();
+  const typeRadio = document.querySelector('input[name=link_type]:checked');
+  const link_type = typeRadio ? typeRadio.value : 'doc';
+  if (!url) { alert('Please enter a URL.'); return; }
+  try {
+    await api(`/api/projects/${projectId}/links`, 'POST', { url, title: title || url, link_type });
+    closeModal();
+    const project = state.projects.find(p => p.id === projectId);
+    if (project) await renderProjectPage(project);
+  } catch (e) {
+    alert('Failed to add link: ' + e.message);
+  }
+}
+
+async function deleteProjectLink(projectId, linkId) {
+  if (!confirm('Remove this link from the project?')) return;
+  await api(`/api/projects/${projectId}/links/${linkId}`, 'DELETE');
   const project = state.projects.find(p => p.id === projectId);
   if (project) await renderProjectPage(project);
 }
@@ -1319,6 +1928,35 @@ async function confirmMoveChat(chatId) {
 }
 
 // === Rename/delete chat ===
+function renameCurrentChat() {
+  if (!state.currentChat) return;
+  renameChat(state.currentChat.id);
+}
+
+async function newChatInCurrentProject() {
+  const projectId = state.currentChat?.project_id;
+  if (!projectId) return;
+  const proj = state.projects.find(p => p.id === projectId);
+  const chat = await api('/api/chats', 'POST', { title: 'New Chat', project_id: projectId });
+  state.chats = [chat, ...state.chats];
+  renderSidebar();
+  await openChat(chat.id);
+}
+
+function updateProjectChatBtn() {
+  const btn = document.getElementById('new-project-chat-btn');
+  if (!btn) return;
+  const projectId = state.currentChat?.project_id;
+  if (!projectId) { btn.style.display = 'none'; return; }
+  const proj = state.projects.find(p => p.id === projectId);
+  const projName = proj ? proj.name : 'project';
+  const shortName = projName.length > 20 ? projName.slice(0, 18) + '…' : projName;
+  btn.textContent = `＋ Chat in ${shortName}`;
+  btn.title = `Start a new chat in "${projName}"`;
+  // Show for all roles (guests can create chats within their accessible projects — server enforces access)
+  btn.style.display = '';
+}
+
 async function renameChat(id) {
   const chat = state.chats.find(c => c.id === id);
   if (!chat) return;
@@ -1342,8 +1980,13 @@ async function saveChatTitle(id) {
   }
   closeModal();
   renderSidebar();
-  // Persist to server
-  const chat = await api(`/api/chats/${id}`, 'PUT', { title });
+  // Persist to server — preserve project_id and telegram_session_key to avoid nullifying them
+  const existing = state.chats.find(c => c.id === id);
+  const chat = await api(`/api/chats/${id}`, 'PUT', {
+    title,
+    project_id: existing?.project_id || null,
+    telegram_session_key: existing?.telegram_session_key || null,
+  });
   if (idx >= 0) state.chats[idx] = chat;
   if (state.currentChat?.id === id) state.currentChat = chat;
 }
@@ -1492,6 +2135,69 @@ async function api(url, method = 'GET', body = null) {
 function esc(str) {
   if (!str) return '';
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// === Phase 4: Approval helpers ===
+// Track pending approvals this user submitted: Map<approvalId, { actionPayload }>
+const pendingApprovals = new Map();
+
+function insertAndSend(text) {
+  const input = document.getElementById('msg-input');
+  if (!input) return;
+  input.value = text;
+  autoResize(input);
+  sendMessage();
+}
+
+async function renderApprovalCard(approvalId, containerEl) {
+  try {
+    const approval = await api(`/api/approvals/${approvalId}`);
+    const user = window.currentUser;
+    const canDecide = (user?.role === 'admin') ||
+      (user?.role === 'accord' && approval.requires_approval === 'accord');
+
+    let statusHtml = '';
+    let actionsHtml = '';
+
+    if (approval.status === 'pending') {
+      if (canDecide) {
+        actionsHtml = `
+          <div class="approval-card-actions">
+            <button class="approval-btn-approve" onclick="approveAction('${approvalId}')">Approve</button>
+            <button class="approval-btn-deny" onclick="denyAction('${approvalId}')">Deny</button>
+          </div>`;
+      } else {
+        actionsHtml = `<div class="approval-status-badge pending">Awaiting approval...</div>`;
+      }
+    } else if (approval.status === 'approved') {
+      statusHtml = ' approved';
+      actionsHtml = `<div class="approval-status-badge approved">✅ Approved</div>`;
+    } else {
+      statusHtml = ' denied';
+      actionsHtml = `<div class="approval-status-badge denied">❌ Denied</div>`;
+    }
+
+    containerEl.innerHTML = `
+      <div class="approval-card${statusHtml}" data-approval-id="${esc(approvalId)}">
+        <div class="approval-card-title">🔐 Permission Request</div>
+        <div class="approval-card-sub">${esc(approval.guest_display_name)} wants to run <strong>${esc(approval.action_name)}</strong><br><span style="font-size:12px;color:var(--text-muted)">${esc(approval.permission)}</span></div>
+        ${actionsHtml}
+      </div>`;
+  } catch (e) {
+    containerEl.innerHTML = `<div class="approval-card"><div class="approval-card-title">🔐 Permission Request</div><div class="approval-card-sub" style="color:var(--text-muted)">Could not load approval details.</div></div>`;
+  }
+}
+
+async function approveAction(approvalId) {
+  try {
+    await api(`/api/approvals/${approvalId}/approve`, 'POST');
+  } catch (e) { showToast('Error: ' + e.message); }
+}
+
+async function denyAction(approvalId) {
+  try {
+    await api(`/api/approvals/${approvalId}/deny`, 'POST');
+  } catch (e) { showToast('Error: ' + e.message); }
 }
 
 // === Admin: rename all chats ===
@@ -1881,10 +2587,37 @@ async function openWorkflow(workflowPath, workflowName, el) {
 
   try {
     const res = await api(`/api/workflows/content?workflowPath=${encodeURIComponent(workflowPath)}`);
-    body.innerHTML = renderMarkdown(res.content);
+    const content = res.content;
+    body.innerHTML = `
+      ${renderMarkdown(content)}
+      <div class="skills-viewer-footer">
+        <button class="skills-use-btn" onclick="handleUseWorkflow(${JSON.stringify(workflowName)}, ${JSON.stringify(content)})">▶ Use Workflow</button>
+      </div>`;
     body.querySelectorAll('pre code').forEach(block => hljs.highlightElement(block));
   } catch (e) {
     body.innerHTML = `<div style="color:var(--danger)">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+async function handleUseWorkflow(workflowName, workflowContent) {
+  if (window.currentUser?.role === 'guest') {
+    const chatId = state.currentChat?.id;
+    if (!chatId) { showToast('Open a chat first'); return; }
+    try {
+      const res = await api(`/api/chats/${chatId}/request-action`, 'POST', {
+        permission: 'run_workflows', actionName: workflowName, actionPayload: workflowContent
+      });
+      if (res.allowed) {
+        insertAndSend(workflowContent);
+      } else if (res.pending) {
+        pendingApprovals.set(res.approvalId, { actionPayload: workflowContent });
+        showToast('Approval requested. Waiting for an admin to review.');
+      } else {
+        showToast(res.message || 'You don\'t have permission to run this action.');
+      }
+    } catch (e) { showToast('Error: ' + e.message); }
+  } else {
+    insertAndSend(workflowContent);
   }
 }
 
@@ -2252,10 +2985,37 @@ async function openSkill(skillPath, skillName, el) {
 
   try {
     const res = await api(`/api/skills/content?skillPath=${encodeURIComponent(skillPath)}`);
-    body.innerHTML = renderMarkdown(res.content);
+    const content = res.content;
+    body.innerHTML = `
+      ${renderMarkdown(content)}
+      <div class="skills-viewer-footer">
+        <button class="skills-use-btn" onclick="handleUseSkill(${JSON.stringify(skillName)}, ${JSON.stringify(content)})">▶ Use Skill</button>
+      </div>`;
     body.querySelectorAll('pre code').forEach(block => hljs.highlightElement(block));
   } catch (e) {
     body.innerHTML = `<div style="color:var(--danger)">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+async function handleUseSkill(skillName, skillContent) {
+  if (window.currentUser?.role === 'guest') {
+    const chatId = state.currentChat?.id;
+    if (!chatId) { showToast('Open a chat first'); return; }
+    try {
+      const res = await api(`/api/chats/${chatId}/request-action`, 'POST', {
+        permission: 'run_skills', actionName: skillName, actionPayload: skillContent
+      });
+      if (res.allowed) {
+        insertAndSend(skillContent);
+      } else if (res.pending) {
+        pendingApprovals.set(res.approvalId, { actionPayload: skillContent });
+        showToast('Approval requested. Waiting for an admin to review.');
+      } else {
+        showToast(res.message || 'You don\'t have permission to run this action.');
+      }
+    } catch (e) { showToast('Error: ' + e.message); }
+  } else {
+    insertAndSend(skillContent);
   }
 }
 
@@ -2295,6 +3055,90 @@ function retryMsg(btn) {
   sendMessage();
 }
 
+// === Agent status sync (for non-sender users) ===
+async function syncAgentStatus(chatId) {
+  try {
+    const status = await api(`/api/chats/${chatId}/agent-status`);
+    state.chatAgentBusy[chatId] = !!status.busy;
+    state.chatThinkingMsgId[chatId] = status.busy ? (status.thinkingMsgId || null) : null;
+    state.chatSharedQueue[chatId] = status.queue || [];
+    if (status.busy) {
+      startThinkingCycle();
+      // If there's no local poll but server says busy, register a synthetic poll
+      // so hasPendingPoll returns true and the stop button shows
+      if (!hasPendingPoll(chatId) && status.thinkingMsgId) {
+        const interval = setInterval(async () => {
+          if (!state.pendingPolls[chatId]) return;
+          if (!state.chatAgentBusy[chatId]) {
+            clearPollInterval(chatId);
+            stopThinkingCycle();
+            updateStopBtn(chatId);
+            return;
+          }
+          // Check if the thinking msg has resolved
+          try {
+            const msg = await api(`/api/messages/${status.thinkingMsgId}`);
+            if (msg.content !== '...thinking...' && msg.content !== '') {
+              state.chatAgentBusy[chatId] = false;
+              clearPollInterval(chatId);
+              stopThinkingCycle();
+              updateStopBtn(chatId);
+              if (state.currentChat?.id === chatId) { await loadMessages(); scrollToBottom(); }
+            }
+          } catch {}
+        }, 1500);
+        state.pendingPolls[chatId] = { aiMsgId: status.thinkingMsgId, interval, synthetic: true };
+        updateStopBtn(chatId);
+      }
+    }
+    if (state.currentChat?.id === chatId) renderSharedQueue(chatId);
+  } catch {}
+}
+
+// === Shared queue display (server-synced) ===
+function renderSharedQueue(chatId) {
+  // Only show if there are server-queued items AND no local queue items
+  const serverQueue = state.chatSharedQueue[chatId] || [];
+  const localQueue = getChatQueue(chatId);
+  // Merge: local items are the "my" items, server items include all users
+  // Deduplicate by id so local items don't appear twice
+  const localIds = new Set(localQueue.map(i => i.id));
+  const serverOnlyItems = serverQueue.filter(i => !localIds.has(i.id));
+  if (serverOnlyItems.length > 0 || localQueue.length > 0) {
+    renderQueue(); // re-render local queue which will also call renderSharedQueueSection
+    renderSharedQueueSection(chatId, serverOnlyItems);
+  } else {
+    renderSharedQueueSection(chatId, []);
+  }
+}
+
+function renderSharedQueueSection(chatId, items) {
+  let container = document.getElementById('shared-queue-section');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'shared-queue-section';
+    const inputArea = document.getElementById('input-area');
+    if (inputArea) inputArea.prepend(container);
+  }
+  if (!items.length) {
+    container.style.display = 'none';
+    container.innerHTML = '';
+    return;
+  }
+  container.style.display = 'block';
+  let html = `<div class="queue-header"><span class="queue-title">⏳ Waiting (${items.length})</span></div>`;
+  items.forEach((item, idx) => {
+    const sender = item.senderName || 'User';
+    const preview = item.preview || '';
+    html += `<div class="queue-item">
+      <span class="queue-idx">${idx + 1}</span>
+      <span class="queue-item-sender" style="font-size:11px;opacity:0.6;margin-right:4px">${esc(sender)}:</span>
+      <span class="queue-item-text">${esc(preview.length > 70 ? preview.slice(0, 70) + '\u2026' : preview)}</span>
+    </div>`;
+  });
+  container.innerHTML = html;
+}
+
 // === Message queue (per-chat) ===
 function getChatQueue(chatId) {
   if (!state.messageQueue[chatId]) state.messageQueue[chatId] = [];
@@ -2314,6 +3158,11 @@ function renderQueue() {
   if (!queue.length) {
     container.style.display = 'none';
     container.innerHTML = '';
+    // Still render shared queue items from other users
+    if (chatId) {
+      const serverQueue = state.chatSharedQueue[chatId] || [];
+      renderSharedQueueSection(chatId, serverQueue);
+    }
     return;
   }
   container.style.display = 'block';
@@ -2338,6 +3187,7 @@ function clearQueue() {
   const chatId = state.currentChat?.id;
   if (chatId) state.messageQueue[chatId] = [];
   renderQueue();
+  // Note: shared queue (other users) can only be cleared server-side; don't clear chatSharedQueue
 }
 
 function removeQueueItem(id) {
@@ -2386,10 +3236,50 @@ async function stopGeneration() {
   stopThinkingCycle();
   updateStopBtn(chatId);
   await loadMessages();
-  activateLastUserMessageEdit();
+  showEditButtonOnLastUserMsg();
 }
 
 // === Edit-after-stop ===
+
+// After stopping, show a transient "Edit" button on the last user message.
+// Only visible if the user stopped mid-generation (not on a completed reply).
+let _stoppedChatId = null; // track which chat had a stop so we can clear on next send
+
+function showEditButtonOnLastUserMsg() {
+  const area = document.getElementById('messages-area');
+  const userMsgs = area.querySelectorAll('.message.user[data-id]');
+  if (!userMsgs.length) return;
+  const lastUserMsg = userMsgs[userMsgs.length - 1];
+  const msgId = lastUserMsg.getAttribute('data-id');
+
+  // Don't add twice
+  if (lastUserMsg.querySelector('.edit-after-stop-btn')) return;
+
+  const btn = document.createElement('button');
+  btn.className = 'msg-action-btn edit-after-stop-btn';
+  btn.textContent = '✏️ Edit';
+  btn.title = 'Edit and resend this message';
+  btn.onclick = () => {
+    btn.remove();
+    enterMessageEditMode(lastUserMsg, msgId);
+  };
+
+  // Inject after the message-content div
+  const actionsEl = lastUserMsg.querySelector('.message-actions');
+  if (actionsEl) {
+    actionsEl.appendChild(btn);
+  } else {
+    const contentEl = lastUserMsg.querySelector('.message-content');
+    if (contentEl) contentEl.appendChild(btn);
+  }
+
+  _stoppedChatId = state.currentChat?.id;
+}
+
+function clearEditAfterStopBtn() {
+  document.querySelectorAll('.edit-after-stop-btn').forEach(el => el.remove());
+  _stoppedChatId = null;
+}
 
 function activateLastUserMessageEdit() {
   const area = document.getElementById('messages-area');
@@ -2566,3 +3456,1047 @@ function updateStopBtn(chatId) {
   const active = !!(chatId && hasPendingPoll(chatId));
   btn.style.display = active ? 'flex' : 'none';
 }
+
+// ============================================================
+// ADMIN PANEL
+// ============================================================
+
+let adminPanelState = {
+  activeTab: 'users',
+  users: [],
+  projects: [],
+  projectAccess: [],
+  guestPermsUserId: null,
+  guestPerms: [],
+  expandedProjects: new Set(),
+};
+
+function showAdminPanel() {
+  // Remove existing overlay if any
+  const existing = document.getElementById('admin-panel-overlay');
+  if (existing) existing.remove();
+
+  const user = window.currentUser;
+  const isAdmin = user && user.role === 'admin';
+
+  const overlay = document.createElement('div');
+  overlay.id = 'admin-panel-overlay';
+  overlay.innerHTML = `
+    <div class="admin-header">
+      <h1>🛠 Admin Panel</h1>
+      <span style="font-size:12px;color:var(--text-muted)">${user?.email || ''}</span>
+      <button class="admin-close-btn" onclick="closeAdminPanel()">✕</button>
+    </div>
+    <div class="admin-tabs">
+      <button class="admin-tab active" data-tab="users" onclick="switchAdminTab('users',this)">User Management</button>
+      <button class="admin-tab" data-tab="perms" onclick="switchAdminTab('perms',this)">Guest Permissions</button>
+      <button class="admin-tab" data-tab="access" onclick="switchAdminTab('access',this)">Project Access</button>
+      <button class="admin-tab" data-tab="audit" onclick="switchAdminTab('audit',this)">Audit Log</button>
+      ${isAdmin ? `<button class="admin-tab" data-tab="tech" onclick="switchAdminTab('tech',this)">Technical Settings</button>` : ''}
+    </div>
+    <div class="admin-body" id="admin-body">
+      <div style="color:var(--text-muted);font-size:13px;padding:20px">Loading...</div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  adminPanelState.activeTab = 'users';
+  loadAdminTab('users');
+}
+
+function closeAdminPanel() {
+  const el = document.getElementById('admin-panel-overlay');
+  if (el) el.remove();
+}
+
+function switchAdminTab(tab, btn) {
+  adminPanelState.activeTab = tab;
+  document.querySelectorAll('.admin-tab').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  loadAdminTab(tab);
+}
+
+async function loadAdminTab(tab) {
+  const body = document.getElementById('admin-body');
+  if (!body) return;
+  body.innerHTML = `<div style="color:var(--text-muted);font-size:13px;padding:20px">Loading...</div>`;
+  try {
+    if (tab === 'users') await renderAdminUsers(body);
+    else if (tab === 'perms') await renderAdminPerms(body);
+    else if (tab === 'access') await renderAdminAccess(body);
+    else if (tab === 'audit') await renderAdminAuditLog(body);
+    else if (tab === 'tech') await renderAdminTech(body);
+  } catch (e) {
+    body.innerHTML = `<div class="admin-msg err">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+// ---- User Management ----
+async function renderAdminUsers(body) {
+  const users = await api('/api/admin/users');
+  adminPanelState.users = users;
+  body.innerHTML = `
+    <div class="admin-toolbar">
+      <div class="admin-section-title">Users (${users.length})</div>
+      <button class="admin-btn primary" onclick="showInviteModal()">+ Invite User</button>
+    </div>
+    <table class="admin-table">
+      <thead><tr>
+        <th>Email</th><th>Display Name</th><th>Role</th><th>Status</th><th>Actions</th>
+      </tr></thead>
+      <tbody>
+        ${users.map(u => `
+          <tr>
+            <td>${esc(u.email)}</td>
+            <td>${esc(u.display_name)}</td>
+            <td><span class="role-badge ${u.role}">${u.role}</span></td>
+            <td><span class="status-badge ${u.active !== 0 ? 'active' : 'inactive'}">${u.active !== 0 ? 'Active' : 'Inactive'}</span></td>
+            <td style="display:flex;gap:6px;flex-wrap:wrap">
+              <button class="admin-btn sm" onclick="showEditUserModal('${u.id}')">Edit</button>
+              ${u.active !== 0
+                ? `<button class="admin-btn sm danger" onclick="toggleUserActive('${u.id}',0)">Deactivate</button>`
+                : `<button class="admin-btn sm" onclick="toggleUserActive('${u.id}',1)">Reactivate</button>`
+              }
+            </td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+function showInviteModal() {
+  const modal = createAdminModal(`
+    <h3>Invite New User</h3>
+    <label>Email</label>
+    <input type="email" id="invite-email" placeholder="user@example.com"/>
+    <label>Display Name (optional)</label>
+    <input type="text" id="invite-name" placeholder="Full name"/>
+    <label>Role</label>
+    <select id="invite-role">
+      <option value="guest">Guest</option>
+      <option value="accord">Accord</option>
+    </select>
+    <div id="invite-msg"></div>
+    <div class="admin-modal-btns">
+      <button class="admin-btn" onclick="closeAdminModal()">Cancel</button>
+      <button class="admin-btn primary" onclick="doInviteUser()">Send Invite</button>
+    </div>
+  `);
+}
+
+async function doInviteUser() {
+  const email = document.getElementById('invite-email')?.value?.trim();
+  const name = document.getElementById('invite-name')?.value?.trim();
+  const role = document.getElementById('invite-role')?.value;
+  const msg = document.getElementById('invite-msg');
+  if (!email) { showAdminMsg(msg, 'Email required', 'err'); return; }
+  try {
+    const res = await fetch('/api/admin/users/invite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, role, display_name: name })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      showAdminMsg(msg, `✓ Invited! Temp password: ${data.tempPassword}`, 'ok');
+      setTimeout(() => { closeAdminModal(); loadAdminTab('users'); }, 3000);
+    } else {
+      showAdminMsg(msg, data.error || 'Error', 'err');
+    }
+  } catch (e) { showAdminMsg(msg, e.message, 'err'); }
+}
+
+function showEditUserModal(userId) {
+  const user = adminPanelState.users.find(u => u.id === userId);
+  if (!user) return;
+  createAdminModal(`
+    <h3>Edit User: ${esc(user.email)}</h3>
+    <label>Display Name</label>
+    <input type="text" id="edit-display-name" value="${esc(user.display_name)}"/>
+    <label>Role</label>
+    <select id="edit-role">
+      <option value="guest" ${user.role === 'guest' ? 'selected' : ''}>Guest</option>
+      <option value="accord" ${user.role === 'accord' ? 'selected' : ''}>Accord</option>
+      <option value="admin" ${user.role === 'admin' ? 'selected' : ''}>Admin</option>
+    </select>
+    <div id="edit-user-msg"></div>
+    <div class="admin-modal-btns">
+      <button class="admin-btn" onclick="closeAdminModal()">Cancel</button>
+      <button class="admin-btn primary" onclick="doEditUser('${userId}')">Save</button>
+    </div>
+  `);
+}
+
+async function doEditUser(userId) {
+  const display_name = document.getElementById('edit-display-name')?.value?.trim();
+  const role = document.getElementById('edit-role')?.value;
+  const msg = document.getElementById('edit-user-msg');
+  try {
+    const res = await fetch(`/api/admin/users/${userId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ display_name, role })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      showAdminMsg(msg, '✓ Saved', 'ok');
+      setTimeout(() => { closeAdminModal(); loadAdminTab('users'); }, 1000);
+    } else {
+      showAdminMsg(msg, data.error || 'Error', 'err');
+    }
+  } catch (e) { showAdminMsg(msg, e.message, 'err'); }
+}
+
+async function toggleUserActive(userId, active) {
+  try {
+    await fetch(`/api/admin/users/${userId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active })
+    });
+    loadAdminTab('users');
+  } catch (e) { alert(e.message); }
+}
+
+// ---- Guest Permissions ----
+async function renderAdminPerms(body) {
+  const users = adminPanelState.users.length ? adminPanelState.users : await api('/api/admin/users');
+  adminPanelState.users = users;
+  const guests = users.filter(u => u.role === 'guest');
+
+  body.innerHTML = `
+    <div class="admin-section-title">Guest Permissions</div>
+    ${guests.length === 0 ? '<p style="color:var(--text-muted);font-size:13px">No guest users found.</p>' : `
+      <div style="margin-bottom:16px">
+        <label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:6px">Select Guest</label>
+        <select id="guest-select" onchange="loadGuestPerms(this.value)" style="padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:7px;color:var(--text);font-size:13px;">
+          <option value="">-- Select a guest --</option>
+          ${guests.map(g => `<option value="${g.id}">${esc(g.email)}</option>`).join('')}
+        </select>
+      </div>
+      <div id="guest-perms-panel" style="display:none">
+        <div id="guest-perms-rows"></div>
+        <div style="margin-top:16px;display:flex;align-items:center;gap:10px">
+          <button class="admin-btn primary" onclick="saveGuestPerms()">Save Permissions</button>
+          <div id="guest-perms-msg" style="font-size:13px"></div>
+        </div>
+      </div>
+    `}
+  `;
+}
+
+async function loadGuestPerms(userId) {
+  if (!userId) {
+    document.getElementById('guest-perms-panel').style.display = 'none';
+    return;
+  }
+  adminPanelState.guestPermsUserId = userId;
+  const perms = await api(`/api/admin/guest-permissions/${userId}`);
+  adminPanelState.guestPerms = perms;
+
+  const PERM_DEFS = [
+    { key: 'run_workflows', label: 'Run Workflows' },
+    { key: 'run_skills', label: 'Run Skills' },
+    { key: 'run_mcps', label: 'Run MCPs' },
+  ];
+
+  const rowsEl = document.getElementById('guest-perms-rows');
+  rowsEl.innerHTML = PERM_DEFS.map(def => {
+    const existing = perms.find(p => p.permission === def.key);
+    const enabled = !!existing;
+    const approval = existing?.requires_approval || '';
+    return `
+      <div class="perm-row">
+        <div class="perm-label">${def.label}</div>
+        <div class="perm-enabled">
+          <input type="checkbox" id="perm-${def.key}" ${enabled ? 'checked' : ''}
+            onchange="document.getElementById('perm-approval-${def.key}').style.display=this.checked?'inline':'none'"/>
+          <label for="perm-${def.key}" style="font-size:12px;cursor:pointer">Enabled</label>
+        </div>
+        <div class="perm-approval" id="perm-approval-${def.key}" style="display:${enabled ? 'inline' : 'none'}">
+          <select id="perm-level-${def.key}">
+            <option value="" ${!approval ? 'selected' : ''}>No approval needed</option>
+            <option value="accord" ${approval === 'accord' ? 'selected' : ''}>Requires Accord approval</option>
+            <option value="admin" ${approval === 'admin' ? 'selected' : ''}>Requires Admin approval</option>
+          </select>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  document.getElementById('guest-perms-panel').style.display = 'block';
+}
+
+async function saveGuestPerms() {
+  const userId = adminPanelState.guestPermsUserId;
+  const msg = document.getElementById('guest-perms-msg');
+  if (!userId) return;
+  const PERMS = ['run_workflows', 'run_skills', 'run_mcps'];
+  const permissions = [];
+  for (const key of PERMS) {
+    const cb = document.getElementById(`perm-${key}`);
+    if (cb && cb.checked) {
+      const lvl = document.getElementById(`perm-level-${key}`)?.value || null;
+      permissions.push({ permission: key, requires_approval: lvl || null });
+    }
+  }
+  try {
+    const res = await fetch(`/api/admin/guest-permissions/${userId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ permissions })
+    });
+    const data = await res.json();
+    if (data.ok) { msg.className = 'admin-msg ok'; msg.textContent = '✓ Saved'; }
+    else { msg.className = 'admin-msg err'; msg.textContent = data.error || 'Error'; }
+  } catch (e) { msg.className = 'admin-msg err'; msg.textContent = e.message; }
+}
+
+// ---- Project Access ----
+async function renderAdminAccess(body) {
+  const [accessRows, allProjects, allUsers] = await Promise.all([
+    api('/api/admin/project-access'),
+    api('/api/projects'),
+    api('/api/admin/users'),
+  ]);
+  adminPanelState.projectAccess = accessRows;
+  adminPanelState.projects = allProjects;
+  adminPanelState.users = allUsers;
+
+  // Group access by project
+  const byProject = {};
+  for (const p of allProjects) byProject[p.id] = { project: p, members: [] };
+  for (const row of accessRows) {
+    if (byProject[row.project_id]) byProject[row.project_id].members.push(row);
+  }
+
+  body.innerHTML = `
+    <div class="admin-toolbar">
+      <div class="admin-section-title">Project Access</div>
+    </div>
+    <div id="project-access-list">
+      ${Object.values(byProject).map(({ project: p, members }) => `
+        <div class="project-access-group">
+          <div class="project-access-header" onclick="toggleProjectAccessGroup('${p.id}')">
+            <span>📁 ${esc(p.name)}</span>
+            <span style="font-size:12px;color:var(--text-muted)">${members.length} member(s)</span>
+          </div>
+          <div class="project-access-body" id="pac-${p.id}" style="display:none">
+            ${members.length === 0 ? '<div style="color:var(--text-muted);font-size:13px;padding:6px 0">No members</div>' :
+              members.map(m => `
+                <div class="project-member-row">
+                  <div class="project-member-email">${esc(m.email)}</div>
+                  <div class="project-member-role"><span class="role-badge ${m.role}">${m.role}</span></div>
+                  <button class="admin-btn sm danger" onclick="revokeProjectAccess('${p.id}','${m.user_id}')">Revoke</button>
+                </div>
+              `).join('')
+            }
+            <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+              <select id="add-user-${p.id}" style="flex:1;padding:6px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;">
+                <option value="">-- Add user --</option>
+                ${allUsers.filter(u => !members.find(m => m.user_id === u.id))
+                  .map(u => `<option value="${u.id}">${esc(u.email)} (${u.role})</option>`).join('')}
+              </select>
+              <button class="admin-btn sm primary" onclick="grantProjectAccess('${p.id}')">Grant</button>
+            </div>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function toggleProjectAccessGroup(projectId) {
+  const el = document.getElementById(`pac-${projectId}`);
+  if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
+async function grantProjectAccess(projectId) {
+  const sel = document.getElementById(`add-user-${projectId}`);
+  const userId = sel?.value;
+  if (!userId) return;
+  try {
+    const res = await fetch('/api/admin/project-access', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_id: projectId, user_id: userId })
+    });
+    const data = await res.json();
+    if (data.ok) loadAdminTab('access');
+    else alert(data.error || 'Error granting access');
+  } catch (e) { alert(e.message); }
+}
+
+async function revokeProjectAccess(projectId, userId) {
+  if (!confirm('Revoke this user\'s access?')) return;
+  try {
+    const res = await fetch(`/api/admin/project-access/${projectId}/${userId}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (data.ok) loadAdminTab('access');
+    else alert(data.error || 'Error revoking access');
+  } catch (e) { alert(e.message); }
+}
+
+// ---- Audit Log ----
+async function renderAdminAuditLog(body) {
+  body.innerHTML = `<div style="color:var(--text-muted);font-size:13px;padding:20px">Loading audit log...</div>`;
+  try {
+    const rows = await api('/api/admin/audit-log');
+    const fmtTs = (ts) => {
+      const d = new Date(ts);
+      return d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+    };
+    body.innerHTML = `
+      <div class="admin-toolbar">
+        <div class="admin-section-title">Audit Log (last 200 events)</div>
+        <button class="admin-btn" onclick="loadAdminTab('audit')">↺ Refresh</button>
+      </div>
+      ${rows.length === 0 ? '<p style="color:var(--text-muted);font-size:13px">No audit events yet.</p>' : `
+      <div style="overflow-x:auto">
+        <table class="admin-table audit-table">
+          <thead><tr>
+            <th>Timestamp</th><th>Actor</th><th>Action</th><th>Target</th><th>Details</th>
+          </tr></thead>
+          <tbody>
+            ${rows.map(r => `
+              <tr>
+                <td style="white-space:nowrap;font-size:11px">${esc(fmtTs(r.timestamp))}</td>
+                <td style="font-size:12px">${esc(r.actor_email || r.actor_user_id || '–')}</td>
+                <td><span class="audit-action-badge ${esc(r.action.replace('_','-'))}">${esc(r.action)}</span></td>
+                <td style="font-size:12px">${esc(r.target || '–')}</td>
+                <td style="font-size:11px;color:var(--text-muted)">${r.details ? esc(JSON.stringify(r.details)) : '–'}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>`}
+    `;
+  } catch (e) {
+    body.innerHTML = `<div class="admin-msg err">Error loading audit log: ${esc(e.message)}</div>`;
+  }
+}
+
+// ---- Technical Settings ----
+async function renderAdminTech(body) {
+  body.innerHTML = `
+    <div class="admin-section-title">Technical Settings</div>
+    <div id="pm2-status-section">
+      <div style="color:var(--text-muted);font-size:13px">Loading PM2 status...</div>
+    </div>
+    <div style="margin:16px 0;display:flex;gap:10px;flex-wrap:wrap">
+      <button class="admin-btn primary" onclick="doPM2Restart()">⟳ Restart openclaw-web</button>
+      <button class="admin-btn danger" onclick="doDeploy()">🚀 Deploy (git pull + restart)</button>
+      <button class="admin-btn" onclick="loadServerLog()">📋 Refresh Logs</button>
+    </div>
+    <div id="tech-msg" style="font-size:13px;margin-bottom:12px"></div>
+    <div class="admin-section-title" style="margin-top:16px">Server Log (last 100 lines)</div>
+    <div id="log-viewer" class="log-viewer">Loading...</div>
+  `;
+  loadPM2Status();
+  loadServerLog();
+}
+
+async function loadPM2Status() {
+  const section = document.getElementById('pm2-status-section');
+  if (!section) return;
+  try {
+    const data = await api('/api/admin/pm2-status');
+    if (!data.ok || !data.processes) {
+      section.innerHTML = `<div class="admin-msg err">PM2 unavailable: ${esc(data.error || 'unknown')}</div>`;
+      return;
+    }
+    section.innerHTML = data.processes.map(p => `
+      <div class="pm2-card">
+        <div class="pm2-status-dot ${p.pm2_env?.status || 'stopped'}"></div>
+        <div>
+          <div class="pm2-name">${esc(p.name)}</div>
+          <div class="pm2-meta">
+            PID: ${p.pid || '–'} | Status: ${p.pm2_env?.status || '?'} |
+            Restarts: ${p.pm2_env?.restart_time ?? '?'} |
+            CPU: ${p.monit?.cpu ?? '?'}% | Mem: ${Math.round((p.monit?.memory || 0) / 1024 / 1024)}MB
+          </div>
+        </div>
+      </div>
+    `).join('') || '<div style="color:var(--text-muted);font-size:13px">No PM2 processes found.</div>';
+  } catch (e) {
+    section.innerHTML = `<div class="admin-msg err">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+async function loadServerLog() {
+  const el = document.getElementById('log-viewer');
+  if (!el) return;
+  el.textContent = 'Loading...';
+  try {
+    const data = await api('/api/admin/server-log');
+    el.textContent = data.log || '(empty)';
+    el.scrollTop = el.scrollHeight;
+  } catch (e) {
+    el.textContent = 'Error loading log: ' + e.message;
+  }
+}
+
+async function doPM2Restart() {
+  const msg = document.getElementById('tech-msg');
+  if (!confirm('Restart openclaw-web PM2 process?')) return;
+  msg.className = 'admin-msg'; msg.textContent = 'Restarting...';
+  try {
+    const data = await fetch('/api/admin/pm2-restart', { method: 'POST' }).then(r => r.json());
+    msg.className = 'admin-msg ok'; msg.textContent = data.ok ? '✓ Restarted' : `Error: ${data.error}`;
+    setTimeout(loadPM2Status, 2000);
+  } catch (e) { msg.className = 'admin-msg err'; msg.textContent = e.message; }
+}
+
+async function doDeploy() {
+  const msg = document.getElementById('tech-msg');
+  if (!confirm('This will git pull and restart the server. Continue?')) return;
+  msg.className = 'admin-msg'; msg.textContent = 'Deploying...';
+  try {
+    const data = await fetch('/api/admin/deploy', { method: 'POST' }).then(r => r.json());
+    if (data.ok) {
+      msg.className = 'admin-msg ok'; msg.textContent = '✓ Deployed. Server restarting...';
+    } else {
+      msg.className = 'admin-msg err'; msg.textContent = `Error: ${data.error || data.stderr}`;
+    }
+  } catch (e) { msg.className = 'admin-msg err'; msg.textContent = e.message; }
+}
+
+
+
+// ---- Project Settings Modal ----
+async function showProjectSettings(projectId) {
+  const proj = state.projects.find(p => p.id === projectId);
+  if (!proj) return;
+  try {
+    const { project, members } = await api(`/api/projects/${projectId}/settings`);
+    const allUsers = await api('/api/admin/users');
+    const nonMembers = allUsers.filter(u => !members.find(m => m.id === u.id));
+
+    showModal(`
+      <h3 style="margin:0 0 16px">⚙️ Project Settings: ${esc(project.name)}</h3>
+      <div class="project-settings-section">
+        <h4>Guardrails / Rules</h4>
+        <textarea id="proj-guardrails" style="width:100%;min-height:100px;background:var(--bg);border:1px solid var(--border);border-radius:7px;color:var(--text);padding:10px;font-size:13px;font-family:inherit;resize:vertical;">${esc(project.guardrails || '')}</textarea>
+        <button class="modal-btn primary" onclick="saveProjectGuardrails('${projectId}')">Save Guardrails</button>
+        <div id="guardrails-msg" style="margin-top:6px;font-size:13px"></div>
+      </div>
+      <hr style="margin:16px 0;border:none;border-top:1px solid var(--border)"/>
+      <div class="project-settings-section">
+        <h4>Members</h4>
+        <div id="proj-members-list">
+          ${members.length === 0 ? '<div style="color:var(--text-muted);font-size:13px;margin-bottom:10px">No members assigned</div>' :
+            members.map(m => `
+              <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)">
+                <span style="flex:1;font-size:13px">${esc(m.email)}</span>
+                <span class="role-badge ${m.role}">${m.role}</span>
+                <button class="modal-btn danger-sm" onclick="removeProjMember('${projectId}','${m.id}')">Remove</button>
+              </div>
+            `).join('')
+          }
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <select id="proj-add-user" style="flex:1;padding:7px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;">
+            <option value="">-- Add user --</option>
+            ${nonMembers.map(u => `<option value="${u.id}">${esc(u.email)} (${u.role})</option>`).join('')}
+          </select>
+          <button class="modal-btn primary" onclick="addProjMember('${projectId}')">Add</button>
+        </div>
+        <div id="proj-member-msg" style="margin-top:6px;font-size:13px"></div>
+      </div>
+    `);
+  } catch (e) {
+    alert('Failed to load project settings: ' + e.message);
+  }
+}
+
+async function saveProjectGuardrails(projectId) {
+  const guardrails = document.getElementById('proj-guardrails')?.value || '';
+  const msg = document.getElementById('guardrails-msg');
+  try {
+    const res = await fetch(`/api/projects/${projectId}/guardrails`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ guardrails })
+    });
+    const data = await res.json();
+    if (data.ok) { msg.style.color='#4ade80'; msg.textContent='✓ Saved'; }
+    else { msg.style.color='#f87171'; msg.textContent = data.error || 'Error'; }
+  } catch (e) { msg.style.color='#f87171'; msg.textContent = e.message; }
+}
+
+async function addProjMember(projectId) {
+  const userId = document.getElementById('proj-add-user')?.value;
+  const msg = document.getElementById('proj-member-msg');
+  if (!userId) return;
+  try {
+    const res = await fetch('/api/admin/project-access', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_id: projectId, user_id: userId })
+    });
+    const data = await res.json();
+    if (data.ok) { msg.style.color='#4ade80'; msg.textContent='✓ Added'; showProjectSettings(projectId); }
+    else { msg.style.color='#f87171'; msg.textContent = data.error || 'Error'; }
+  } catch (e) { msg.style.color='#f87171'; msg.textContent = e.message; }
+}
+
+async function removeProjMember(projectId, userId) {
+  const msg = document.getElementById('proj-member-msg');
+  try {
+    const res = await fetch(`/api/admin/project-access/${projectId}/${userId}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (data.ok) { showProjectSettings(projectId); }
+    else { msg.style.color='#f87171'; msg.textContent = data.error || 'Error'; }
+  } catch (e) { msg.style.color='#f87171'; msg.textContent = e.message; }
+}
+
+// ---- Admin Modal helpers ----
+function createAdminModal(html) {
+  const existing = document.getElementById('admin-modal-backdrop');
+  if (existing) existing.remove();
+  const backdrop = document.createElement('div');
+  backdrop.id = 'admin-modal-backdrop';
+  backdrop.className = 'admin-modal-backdrop';
+  backdrop.onclick = (e) => { if (e.target === backdrop) closeAdminModal(); };
+  const modal = document.createElement('div');
+  modal.className = 'admin-modal';
+  modal.innerHTML = html;
+  backdrop.appendChild(modal);
+  document.body.appendChild(backdrop);
+  return modal;
+}
+
+function closeAdminModal() {
+  const el = document.getElementById('admin-modal-backdrop');
+  if (el) el.remove();
+}
+
+function showAdminMsg(el, text, type) {
+  if (!el) return;
+  el.className = `admin-msg ${type}`;
+  el.textContent = text;
+}
+
+// =============================================================================
+// PHASE 3 — Collaborative Chat
+// =============================================================================
+
+// --- Avatar colour palette (deterministic by name) ---
+const AVATAR_COLORS = ['#6366f1','#8b5cf6','#ec4899','#f59e0b','#10b981','#3b82f6','#ef4444','#14b8a6'];
+function getAvatarColor(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) & 0xffffffff;
+  return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length];
+}
+
+// --- SSE per-chat connection ---
+// state.chatSSE: Map<chatId, EventSource>
+if (!state.chatSSE) state.chatSSE = new Map();
+// Throttle typing pings
+const typingPingLastSent = new Map();
+
+// SSE backoff state per chat: Map<chatId, { retries, timer }>
+const sseBackoffState = new Map();
+
+function connectChatSSE(chatId) {
+  // Close any existing SSE for a different chat
+  state.chatSSE.forEach((es, cid) => { if (cid !== chatId) { try { es.close(); } catch {} state.chatSSE.delete(cid); } });
+  // Don't reconnect if already open for this chat
+  if (state.chatSSE.has(chatId)) return;
+
+  // Reset backoff if this is a fresh connection request (not a retry)
+  if (!sseBackoffState.has(chatId)) sseBackoffState.set(chatId, { retries: 0 });
+
+  const es = new EventSource(`/api/chats/${chatId}/stream`);
+  state.chatSSE.set(chatId, es);
+
+  es.onopen = () => {
+    // Reset backoff on successful connection
+    sseBackoffState.set(chatId, { retries: 0 });
+    // Hide reconnecting indicator if shown
+    const ind = document.getElementById('sse-reconnect-indicator');
+    if (ind) ind.style.display = 'none';
+  };
+
+  es.addEventListener('message', async () => {
+    // New message arrived — reload messages if we're viewing this chat
+    if (state.currentChat?.id === chatId) {
+      await loadMessages(); scrollToBottom();
+    }
+  });
+
+  es.addEventListener('agent_status', async (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      state.chatAgentBusy[chatId] = !!data.busy;
+      state.chatThinkingMsgId[chatId] = data.busy ? (data.thinkingMsgId || null) : null;
+      if (data.busy) {
+        if (state.currentChat?.id === chatId) startThinkingCycle();
+      } else {
+        // Only stop thinking cycle if we don't have a local poll running
+        if (!hasPendingPoll(chatId)) {
+          if (state.currentChat?.id === chatId) stopThinkingCycle();
+        }
+        // Clear synthetic poll if agent finished
+        const p = state.pendingPolls[chatId];
+        if (p && p.synthetic) clearPollInterval(chatId);
+        if (state.currentChat?.id === chatId) updateStopBtn(chatId);
+      }
+      // Re-render messages so thinking state updates correctly
+      if (state.currentChat?.id === chatId) {
+        await loadMessages(); scrollToBottom();
+      }
+    } catch {}
+  });
+
+  es.addEventListener('queue_update', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      state.chatSharedQueue[chatId] = data.queue || [];
+      if (state.currentChat?.id === chatId) renderSharedQueue(chatId);
+    } catch {}
+  });
+
+  es.addEventListener('typing', (e) => {
+    if (state.currentChat?.id !== chatId) return;
+    try {
+      const data = JSON.parse(e.data);
+      renderTypingIndicator(data);
+    } catch {}
+  });
+
+  es.addEventListener('participant_joined', async () => {
+    if (state.currentChat?.id !== chatId) return;
+    await refreshParticipants(chatId);
+  });
+
+  es.addEventListener('participant_left', async () => {
+    if (state.currentChat?.id !== chatId) return;
+    await refreshParticipants(chatId);
+  });
+
+  es.addEventListener('chat_closed', () => {
+    if (state.currentChat?.id !== chatId) return;
+    updateCollabUI();
+  });
+
+  // Phase 4: approval events
+  es.addEventListener('approval_request', async () => {
+    if (state.currentChat?.id !== chatId) return;
+    await loadMessages(); scrollToBottom();
+  });
+
+  es.addEventListener('approval_decision', async (e) => {
+    if (state.currentChat?.id !== chatId) return;
+    try {
+      const data = JSON.parse(e.data);
+      const { approvalId, status, actionPayload, guestUserId } = data;
+
+      // Refresh message display
+      await loadMessages(); scrollToBottom();
+
+      // If I'm the guest who requested and it was approved, auto-execute
+      if (status === 'approved' && pendingApprovals.has(approvalId)) {
+        const pending = pendingApprovals.get(approvalId);
+        pendingApprovals.delete(approvalId);
+        const payload = actionPayload || pending.actionPayload;
+        if (payload) {
+          showToast('\u2705 Approved! Running action...');
+          setTimeout(() => insertAndSend(payload), 300);
+        }
+      } else if (status === 'denied' && pendingApprovals.has(approvalId)) {
+        pendingApprovals.delete(approvalId);
+        showToast('\u274c Your request was denied.');
+      }
+    } catch {}
+  });
+
+  es.onerror = () => {
+    try { es.close(); } catch {}
+    state.chatSSE.delete(chatId);
+
+    // Only retry if this is still the active chat
+    if (state.currentChat?.id !== chatId) {
+      sseBackoffState.delete(chatId);
+      return;
+    }
+
+    const backoff = sseBackoffState.get(chatId) || { retries: 0 };
+    const MAX_RETRIES = 10;
+    if (backoff.retries >= MAX_RETRIES) {
+      sseBackoffState.delete(chatId);
+      // Show a permanent error indicator
+      const ind = document.getElementById('sse-reconnect-indicator');
+      if (ind) { ind.textContent = 'Connection lost. Reload to reconnect.'; ind.style.display = 'block'; }
+      return;
+    }
+
+    const delayMs = Math.min(1000 * Math.pow(2, backoff.retries), 30000);
+    backoff.retries++;
+    sseBackoffState.set(chatId, backoff);
+
+    // Show reconnecting indicator
+    const ind = document.getElementById('sse-reconnect-indicator');
+    if (ind) {
+      const secs = Math.round(delayMs / 1000);
+      ind.textContent = `Reconnecting in ${secs}s…`;
+      ind.style.display = 'block';
+    }
+
+    setTimeout(() => {
+      if (state.currentChat?.id === chatId) {
+        connectChatSSE(chatId);
+      } else {
+        sseBackoffState.delete(chatId);
+        const ind2 = document.getElementById('sse-reconnect-indicator');
+        if (ind2) ind2.style.display = 'none';
+      }
+    }, delayMs);
+  };
+}
+
+// --- Typing indicator ---
+function renderTypingIndicator(data) {
+  const el = document.getElementById('typing-indicator');
+  if (!el) return;
+  const names = (data.names || data.users || []).filter(n => n !== window.currentUser?.display_name);
+  let text = '';
+  if (names.length > 0) {
+    const label = names.length === 1 ? names[0] : names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1];
+    text = `<div class="typing-dots"><span></span><span></span><span></span></div> ${esc(label)} ${names.length === 1 ? 'is' : 'are'} typing…`;
+  }
+  el.innerHTML = text;
+}
+
+// --- Typing ping (throttled to every 2s) ---
+function pingTyping(chatId) {
+  const now = Date.now();
+  const last = typingPingLastSent.get(chatId) || 0;
+  if (now - last < 2000) return;
+  typingPingLastSent.set(chatId, now);
+  fetch(`/api/chats/${chatId}/typing`, { method: 'POST', credentials: 'same-origin' }).catch(() => {});
+}
+
+// --- Participants row ---
+async function refreshParticipants(chatId) {
+  try {
+    const participants = await api(`/api/chats/${chatId}/participants`);
+    renderParticipantsRow(participants, chatId);
+  } catch {}
+}
+
+function renderParticipantsRow(participants, chatId) {
+  const row = document.getElementById('participants-row');
+  if (!row) return;
+  if (!participants || participants.length === 0) { row.innerHTML = ''; return; }
+
+  const isOwner = state.currentChat?.owner_id === window.currentUser?.id
+    || window.currentUser?.role === 'admin'
+    || window.currentUser?.role === 'accord';
+
+  row.innerHTML = participants.map(p => {
+    const initial = (p.display_name || '?').charAt(0).toUpperCase();
+    const color = getAvatarColor(p.display_name || p.user_id);
+    const name = esc(p.display_name || p.email || p.user_id);
+    return `<div class="participant-avatar" style="background:${color}" title="${name}">${initial}</div>`;
+  }).join('');
+}
+
+async function removeParticipant(chatId, userId) {
+  try {
+    await api(`/api/chats/${chatId}/participants/${userId}`, 'DELETE');
+    await refreshParticipants(chatId);
+    await renderInviteDropdown(chatId); // refresh dropdown state too
+  } catch (e) { showToast('Failed to remove participant'); }
+}
+
+// --- Invite dropdown ---
+let _inviteDropdownOpen = false;
+
+async function toggleInviteDropdown() {
+  const dd = document.getElementById('invite-dropdown');
+  if (!dd || !state.currentChat) return;
+
+  if (_inviteDropdownOpen) {
+    dd.style.display = 'none';
+    _inviteDropdownOpen = false;
+    return;
+  }
+
+  dd.style.display = 'block';
+  _inviteDropdownOpen = true;
+  dd.innerHTML = '<div class="invite-dd-loading">Loading...</div>';
+  await renderInviteDropdown(state.currentChat.id);
+}
+
+async function renderInviteDropdown(chatId) {
+  const dd = document.getElementById('invite-dropdown');
+  if (!dd) return;
+  try {
+    const users = await api(`/api/chats/${chatId}/all-users`);
+    const currentUserId = window.currentUser?.id;
+
+    dd.innerHTML = `
+      <div class="invite-dd-header">Chat participants</div>
+      ${users.map(u => {
+        const initial = (u.display_name || '?').charAt(0).toUpperCase();
+        const color = getAvatarColor(u.display_name || u.id);
+        const name = esc(u.display_name || u.email);
+        const email = esc(u.email);
+        const isMe = u.id === currentUserId;
+        const isParticipant = !!u.is_participant;
+        const rowClass = 'invite-dd-row' + (isMe ? ' invite-dd-me' : '');
+        const toggleBtn = isMe ? '' : `<button class="invite-dd-toggle ${isParticipant ? 'is-member' : ''}" data-chatid="${chatId}" data-uid="${u.id}" data-member="${isParticipant ? '1' : '0'}" onclick="event.stopPropagation(); toggleParticipant(this)">${isParticipant ? '✓' : '+'}</button>`;
+        return `
+          <div class="${rowClass}">
+            <div class="invite-dd-avatar" style="background:${color}">${initial}</div>
+            <div class="invite-dd-info">
+              <div class="invite-dd-name">${name}${isMe ? ' <span class="invite-dd-you">(you)</span>' : ''}</div>
+              <div class="invite-dd-email">${email}</div>
+            </div>
+            ${toggleBtn}
+          </div>`;
+      }).join('')}
+    `;
+  } catch (e) {
+    dd.innerHTML = `<div class="invite-dd-loading">Error loading users</div>`;
+  }
+}
+
+async function toggleParticipant(btn) {
+  if (btn.disabled) return;
+  const chatId = btn.dataset.chatid;
+  const userId = btn.dataset.uid;
+  const isMember = btn.dataset.member === '1';
+
+  // Show spinner, lock button
+  btn.disabled = true;
+  const prevHTML = btn.innerHTML;
+  btn.innerHTML = '<span class="invite-spinner"></span>';
+
+  try {
+    if (isMember) {
+      await api(`/api/chats/${chatId}/participants/${userId}`, 'DELETE');
+      btn.dataset.member = '0';
+      btn.classList.remove('is-member');
+      btn.innerHTML = '+';
+      showToast('Removed from chat');
+    } else {
+      await api(`/api/chats/${chatId}/participants`, 'POST', { userId });
+      btn.dataset.member = '1';
+      btn.classList.add('is-member');
+      btn.innerHTML = '✓';
+      showToast('✓ Added to chat');
+    }
+    await refreshParticipants(chatId);
+  } catch (e) {
+    btn.innerHTML = prevHTML;
+    if (isMember) btn.classList.add('is-member'); else btn.classList.remove('is-member');
+    showToast('Failed: ' + (e.message || 'error'));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Close invite dropdown when clicking outside
+document.addEventListener('click', (e) => {
+  if (!_inviteDropdownOpen) return;
+  const wrap = document.getElementById('invite-dropdown-wrap');
+  if (wrap && !wrap.contains(e.target)) {
+    document.getElementById('invite-dropdown').style.display = 'none';
+    _inviteDropdownOpen = false;
+  }
+});
+
+// Close user menu when clicking outside
+document.addEventListener('click', (e) => {
+  const dd = document.getElementById('user-menu-dropdown');
+  if (!dd || dd.style.display === 'none') return;
+  const wrap = document.getElementById('user-menu-wrap');
+  if (wrap && !wrap.contains(e.target)) {
+    dd.style.display = 'none';
+  }
+});
+
+// --- Collab button (invite) ---
+async function updateCollabUI() {
+  const wrap = document.getElementById('invite-dropdown-wrap');
+  if (!wrap || !state.currentChat) { if (wrap) wrap.style.display = 'none'; return; }
+
+  const chat = state.currentChat;
+  const role = window.currentUser?.role;
+  const isGuest = role === 'guest';
+  const isOwner = !isGuest && (
+    chat.owner_id === window.currentUser?.id
+    || !chat.owner_id
+    || role === 'admin'
+    || role === 'accord'
+  );
+
+  // Guests never see the invite button
+  wrap.style.display = isOwner ? '' : 'none';
+
+  // Load participants and render avatars
+  try {
+    const participants = await api(`/api/chats/${chat.id}/participants`);
+    renderParticipantsRow(participants, chat.id);
+  } catch {}
+}
+
+// --- /join/:token handling ---
+async function handleJoinRoute() {
+  const m = window.location.pathname.match(/^\/join\/([^/]+)$/);
+  if (!m) return false;
+  const token = m[1];
+
+  // Must be logged in
+  if (!window.currentUser) {
+    // Save token and redirect to login, then back
+    sessionStorage.setItem('pendingJoinToken', token);
+    return true; // caller should show login
+  }
+
+  try {
+    const res = await api(`/api/join/${token}`, 'POST');
+    if (res.ok) {
+      showToast(`✓ Joined "${res.chatTitle || 'chat'}"`);
+      history.replaceState({}, '', '/');
+      await openChat(res.chatId);
+    }
+  } catch (e) {
+    showToast('Could not join: ' + (e.message || 'Invalid or expired link'));
+    history.replaceState({}, '', '/');
+  }
+  return true;
+}
+
+// --- Toast helper (reuse if exists, else create) ---
+function showToast(msg) {
+  let el = document.getElementById('phase3-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'phase3-toast';
+    el.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:8px 16px;font-size:13px;color:var(--text);z-index:9999;transition:opacity 0.3s;pointer-events:none;';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.style.opacity = '1';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.style.opacity = '0'; }, 2500);
+}
+
+// --- Hook into app init: check for pending join token after login ---
+const _origInitApp = typeof initApp === 'function' ? initApp : null;
+// Patch the router to handle /join/ routes
+const _origRouteInitial = typeof routeInitial === 'function' ? routeInitial : null;
+
+// After DOM is ready + user is loaded, check for join token
+document.addEventListener('DOMContentLoaded', () => {
+  // Check if there's a pending join token from a pre-login redirect
+  const pendingToken = sessionStorage.getItem('pendingJoinToken');
+  if (pendingToken) {
+    sessionStorage.removeItem('pendingJoinToken');
+    // Will be handled after login completes via handleJoinRoute
+  }
+});
+

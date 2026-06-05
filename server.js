@@ -1,4 +1,5 @@
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const session = require('express-session');
 const SQLiteStore = require('connect-sqlite3')(session);
 const multer = require('multer');
@@ -8,20 +9,67 @@ const path = require('path');
 const fs = require('fs');
 const https = require('https');
 const http = require('http');
-const { exec } = require('child_process');
-// Track active agent processes for abort: { chatId: { abortController, aiMsgId } }
+const { exec, execFile } = require('child_process');
+// Track active agent child processes for abort: { chatId: { child, aiMsgId } }
 const activeAgentProcesses = {};
+
+// --- Phase 3: SSE Infrastructure ---
+// chatSSEClients: Map<chatId, Set<res>>
+const chatSSEClients = new Map();
+// typingUsers: Map<chatId, Map<userId, lastSeenAt>>
+const typingUsers = new Map();
+
+function broadcastToChat(chatId, eventType, data) {
+  const clients = chatSSEClients.get(chatId);
+  if (!clients || clients.size === 0) return;
+  const payload = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+  clients.forEach(res => {
+    try { res.write(payload); } catch {}
+  });
+}
+
+// Clean up stale typing users every 5s
+setInterval(() => {
+  const now = Date.now();
+  typingUsers.forEach((users, chatId) => {
+    users.forEach((lastSeen, userId) => {
+      if (now - lastSeen > 4000) {
+        users.delete(userId);
+        broadcastToChat(chatId, 'typing', { users: Array.from(users.keys()) });
+      }
+    });
+    if (users.size === 0) typingUsers.delete(chatId);
+  });
+}, 3000);
 
 // Per-chat message queue — holds messages that arrive while the agent is busy
 // chatQueues: Map<chatId, Array<{chat, message, attachments, aiMsgId}>>
 const chatQueues = new Map();
 // chatGatewayBusy: Set<chatId> — chats with an in-flight agent call
 const chatGatewayBusy = new Set();
+// chatQueueMeta: Map<chatId, Array<{id, senderName, preview, enqueuedAt}>> — for broadcasting to clients
+const chatQueueMeta = new Map();
 
-function enqueueMessage(chat, message, attachments, aiMsgId) {
+function broadcastQueueUpdate(chatId) {
+  const meta = chatQueueMeta.get(chatId) || [];
+  broadcastToChat(chatId, 'queue_update', { queue: meta });
+}
+
+function broadcastAgentStatus(chatId, busy) {
+  const proc = activeAgentProcesses[chatId];
+  const thinkingMsgId = busy && proc ? proc.aiMsgId : null;
+  broadcastToChat(chatId, 'agent_status', { busy, thinkingMsgId });
+}
+
+function enqueueMessage(chat, message, attachments, aiMsgId, senderName) {
   if (!chatQueues.has(chat.id)) chatQueues.set(chat.id, []);
   chatQueues.get(chat.id).push({ chat, message, attachments, aiMsgId });
+  // Track metadata for broadcasting
+  if (!chatQueueMeta.has(chat.id)) chatQueueMeta.set(chat.id, []);
+  const preview = (message || '').replace(/^\[From [^\]]+\]: /, '').slice(0, 80);
+  chatQueueMeta.get(chat.id).push({ id: aiMsgId, senderName: senderName || 'User', preview, enqueuedAt: Date.now() });
   console.log(`[queue] Enqueued for chat ${chat.id}, depth=${chatQueues.get(chat.id).length}`);
+  broadcastQueueUpdate(chat.id);
 }
 
 function drainQueue(chatId) {
@@ -30,10 +78,18 @@ function drainQueue(chatId) {
   if (!queue || queue.length === 0) return;
   const next = queue.shift();
   if (queue.length === 0) chatQueues.delete(chatId);
+  // Remove from meta
+  const meta = chatQueueMeta.get(chatId) || [];
+  const metaIdx = meta.findIndex(m => m.id === next.aiMsgId);
+  if (metaIdx >= 0) meta.splice(metaIdx, 1);
+  if (meta.length === 0) chatQueueMeta.delete(chatId); else chatQueueMeta.set(chatId, meta);
   console.log(`[queue] Draining for chat ${chatId}, remaining=${chatQueues.get(chatId)?.length ?? 0}`);
   chatGatewayBusy.add(chatId);
+  broadcastAgentStatus(chatId, true);
+  broadcastQueueUpdate(chatId);
   runAgent(next.chat, next.message, next.attachments, next.aiMsgId).finally(() => {
     chatGatewayBusy.delete(chatId);
+    broadcastAgentStatus(chatId, false);
     drainQueue(chatId);
   });
 }
@@ -63,13 +119,13 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 // --- Middleware ---
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), { etag: false, lastModified: false, setHeaders: (res) => { res.setHeader('Cache-Control', 'no-store'); } }));
 app.use(session({
   store: new SQLiteStore({ db: 'sessions.db', dir: __dirname }),
-  secret: 'openclaw-web-secret',
+  secret: process.env.SESSION_SECRET || 'openclaw-web-secret',
   resave: false,
   saveUninitialized: false,
-  cookie: { maxAge: 7 * 24 * 60 * 60 * 1000 }
+  cookie: { maxAge: 24 * 60 * 60 * 1000 } // default 24h; login sets per-session maxAge
 }));
 
 const storage = multer.diskStorage({
@@ -78,13 +134,72 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
 
-// --- Init password ---
+// --- Init password + seed admin user ---
 setTimeout(async () => {
   const row = await db.get_('SELECT value FROM settings WHERE key = ?', ['password_hash']);
   if (!row) {
-    const hash = bcrypt.hashSync('changeme123', 10);
+    const hash = bcrypt.hashSync('changeme123!', 10);
     await db.run_('INSERT INTO settings (key, value) VALUES (?, ?)', ['password_hash', hash]);
-    console.log('Default password set: changeme123');
+    console.log('Default password set: changeme123!');
+  }
+
+  // Seed admin user if users table is empty
+  try {
+    const userCount = await db.get_('SELECT COUNT(*) as cnt FROM users');
+    if (!userCount || userCount.cnt === 0) {
+      const hashRow = await db.get_('SELECT value FROM settings WHERE key = ?', ['password_hash']);
+      if (hashRow) {
+        const adminId = uuidv4();
+        await db.run_(
+          'INSERT INTO users (id, email, display_name, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+          [adminId, process.env.ADMIN_EMAIL || 'admin@example.com', process.env.ADMIN_DISPLAY_NAME || 'Admin', hashRow.value, 'admin', Date.now()]
+        );
+        console.log('Seeded admin user: ' + (process.env.ADMIN_EMAIL || 'admin@example.com') + '');
+      }
+    }
+  } catch (e) {
+    console.error('Error seeding admin user:', e.message);
+  }
+
+  // Always ensure ' + (process.env.ADMIN_EMAIL || 'admin@example.com') + ' exists as admin (cross-agent guarantee)
+  try {
+    const abdo = await db.get_('SELECT id, role FROM users WHERE email = ?', [process.env.ADMIN_EMAIL || 'admin@example.com']);
+    if (!abdo) {
+      // Not present — create with known password
+      const abdoId = uuidv4();
+      const abdoHash = await bcrypt.hash('changeme123!', 10);
+      await db.run_(
+        'INSERT INTO users (id, email, display_name, password_hash, role, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [abdoId, process.env.ADMIN_EMAIL || 'admin@example.com', process.env.ADMIN_DISPLAY_NAME || 'Admin', abdoHash, 'admin', 1, Date.now()]
+      );
+      console.log('[boot] Created ' + (process.env.ADMIN_EMAIL || 'admin@example.com') + ' as admin');
+    } else if (abdo.role !== 'admin') {
+      // Exists but isn't admin — promote
+      await db.run_('UPDATE users SET role = ?, active = 1 WHERE email = ?', ['admin', '' + (process.env.ADMIN_EMAIL || 'admin@example.com') + '']);
+      console.log('[boot] Promoted ' + (process.env.ADMIN_EMAIL || 'admin@example.com') + ' to admin');
+    } else {
+      // Ensure active
+      await db.run_('UPDATE users SET active = 1 WHERE email = ?', [process.env.ADMIN_EMAIL || 'admin@example.com']);
+    }
+  } catch (e) {
+    console.error('[boot] Error ensuring abdo user:', e.message);
+  }
+
+  // Seed project_access: ensure admin user has access to all existing projects
+  try {
+    const adminUser = await db.get_("SELECT id FROM users WHERE email = (process.env.ADMIN_EMAIL || 'admin@example.com')");
+    if (adminUser) {
+      const allProjects = await db.all_('SELECT id FROM projects');
+      for (const proj of allProjects) {
+        await db.run_(
+          'INSERT OR IGNORE INTO project_access (project_id, user_id, granted_by, granted_at) VALUES (?, ?, ?, ?)',
+          [proj.id, adminUser.id, adminUser.id, Date.now()]
+        );
+      }
+      if (allProjects.length) console.log(`Seeded project_access for admin across ${allProjects.length} project(s)`);
+    }
+  } catch (e) {
+    console.error('Error seeding project_access:', e.message);
   }
 
   // Clean up stuck "...thinking..." messages older than 10 minutes
@@ -99,10 +214,51 @@ setTimeout(async () => {
   }
 }, 500);
 
+// --- Rate limiters ---
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Please try again in 15 minutes.' },
+  skip: (req) => {
+    // Skip rate limiting for internal/localhost requests in dev
+    const ip = req.ip || '';
+    return ip === '::1' || ip === '127.0.0.1';
+  }
+});
+
+// --- Audit log helper ---
+async function writeAuditLog({ actorUserId, actorEmail, action, target, details }) {
+  try {
+    await db.run_(
+      'INSERT INTO audit_log (timestamp, actor_user_id, actor_email, action, target, details) VALUES (?, ?, ?, ?, ?, ?)',
+      [Date.now(), actorUserId || null, actorEmail || null, action, target || null, details ? JSON.stringify(details) : null]
+    );
+  } catch (e) {
+    console.error('[audit] write error:', e.message);
+  }
+}
+
 // --- Auth middleware ---
 const requireAuth = (req, res, next) => {
-  if (req.session.authenticated) return next();
+  if (req.session.userId || req.session.authenticated) return next();
   res.status(401).json({ error: 'Unauthorized' });
+};
+
+// Get effective role for current session (handles legacy sessions)
+function getSessionRole(req) {
+  if (req.session.userId) return req.session.role || 'guest';
+  if (req.session.authenticated) return 'admin'; // legacy session = admin
+  return null;
+}
+
+// requireRole: ensure user has at least one of the specified roles (requires requireAuth first)
+const requireRole = (...roles) => (req, res, next) => {
+  const role = getSessionRole(req);
+  if (!role) return res.status(401).json({ error: 'Unauthorized' });
+  if (roles.includes(role)) return next();
+  return res.status(403).json({ error: 'Forbidden: insufficient role' });
 };
 
 // --- Auth routes ---
@@ -120,17 +276,117 @@ app.post('/api/login', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Shared logout handler
+const handleLogout = (req, res) => { req.session.destroy(); res.json({ ok: true }); };
+app.post('/api/logout', handleLogout);
+app.post('/api/auth/logout', handleLogout);
+
+app.get('/api/me', async (req, res) => {
+  try {
+    if (req.session.userId) {
+      const user = await db.get_('SELECT id, email, display_name, role FROM users WHERE id = ?', [req.session.userId]);
+      if (user) return res.json({ authenticated: true, user });
+    }
+    if (req.session.authenticated) {
+      return res.json({ authenticated: true, user: { id: 'legacy', email: '' + (process.env.ADMIN_EMAIL || 'admin@example.com') + '', display_name: 'Abdo', role: 'admin' } });
+    }
+    res.json({ authenticated: false, user: null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// NEW: email+password login
+app.post('/api/auth/login', authLimiter, async (req, res) => {
+  try {
+    const { email, password, rememberMe } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    const user = await db.get_('SELECT * FROM users WHERE email = ?', [email.toLowerCase().trim()]);
+    if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    // Reject deactivated users
+    if (user.active === 0) {
+      return res.status(403).json({ error: 'Account is deactivated. Contact your administrator.' });
+    }
+    req.session.userId = user.id;
+    req.session.role = user.role;
+    req.session.authenticated = true;
+    // Remember me: 30 days vs 24 hours
+    if (rememberMe) {
+      req.session.cookie.maxAge = 30 * 24 * 60 * 60 * 1000;
+    } else {
+      req.session.cookie.maxAge = 24 * 60 * 60 * 1000;
+    }
+    res.json({ ok: true, user: { id: user.id, email: user.email, display_name: user.display_name, role: user.role } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// NEW: forgot password
+app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
+  res.json({ ok: true }); // Always return ok (no enumeration)
+  try {
+    const { email } = req.body;
+    if (!email) return;
+    const user = await db.get_('SELECT * FROM users WHERE email = ?', [email.toLowerCase().trim()]);
+    if (!user) return;
+    const crypto = require('crypto');
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    await db.run_(
+      'INSERT INTO password_reset_tokens (token, user_id, expires_at, used) VALUES (?, ?, ?, 0)',
+      [resetToken, user.id, Date.now() + 3600000]
+    );
+    // Send email via Gmail API
+    try {
+      const { google } = require('googleapis');
+      const creds = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.openclaw', 'workspace', 'google-creds.json')));
+      const tokenData = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.openclaw', 'workspace', 'google-token.json')));
+      const installed = creds.installed || creds.web || creds;
+      const oauth2 = new google.auth.OAuth2(
+        installed.client_id, installed.client_secret,
+        (installed.redirect_uris || ['urn:ietf:wg:oauth:2.0:oob'])[0]
+      );
+      oauth2.setCredentials(tokenData);
+      const gmail = google.gmail({ version: 'v1', auth: oauth2 });
+      const rawEmail = [
+        'From: ' + (process.env.ADMIN_EMAIL || 'admin@example.com') + '',
+        `To: ${user.email}`,
+        'Content-Type: text/plain; charset=utf-8',
+        'Subject: Reset your password',
+        '',
+        `Reset link:\nhttps://your-agent-url/reset-password?token=${resetToken}\n\nExpires in 1 hour.`
+      ].join('\r\n');
+      await gmail.users.messages.send({ userId: 'me', requestBody: { raw: Buffer.from(rawEmail).toString('base64url') } });
+      console.log(`[auth] Password reset email sent to ${user.email}`);
+    } catch (mailErr) {
+      console.error('[auth] Failed to send reset email:', mailErr.message);
+    }
+  } catch (e) {
+    console.error('[auth] forgot-password error:', e.message);
+  }
+});
+
+// NEW: reset password
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { token, password } = req.body;
+    if (!token || !password) return res.status(400).json({ error: 'Token and password required' });
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    const tokenRow = await db.get_('SELECT * FROM password_reset_tokens WHERE token = ?', [token]);
+    if (!tokenRow) return res.status(400).json({ error: 'Invalid or expired token' });
+    if (tokenRow.used) return res.status(400).json({ error: 'Token already used' });
+    if (tokenRow.expires_at < Date.now()) return res.status(400).json({ error: 'Token expired' });
+    const hash = await bcrypt.hash(password, 10);
+    await db.run_('UPDATE users SET password_hash = ? WHERE id = ?', [hash, tokenRow.user_id]);
+    await db.run_('UPDATE password_reset_tokens SET used = 1 WHERE token = ?', [token]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.get('/api/app-config', (req, res) => {
-  const envLines = (() => { try { return fs.readFileSync(path.join(process.env.HOME || '/home/clawdbot', '.openclaw', '.env'), 'utf8').split('
-'); } catch { return []; } })();
+  const envLines = (() => { try { return fs.readFileSync(path.join(process.env.HOME || '/home/clawdbot', '.openclaw', '.env'), 'utf8').split('\n'); } catch { return []; } })();
   const extraEnv = {};
   for (const line of envLines) { const m = line.match(/^([A-Z0-9_]+)=(.*)$/); if (m) extraEnv[m[1]] = m[2].trim(); }
   const instanceName = extraEnv.INSTANCE_NAME || process.env.INSTANCE_NAME || 'My Agent';
   res.json({ instanceName });
 });
-
-app.post('/api/logout', (req, res) => { req.session.destroy(); res.json({ ok: true }); });
-app.get('/api/me', (req, res) => res.json({ authenticated: !!req.session.authenticated }));
 
 // --- Protected routes ---
 app.use('/api/projects', requireAuth);
@@ -143,7 +399,19 @@ app.use('/api/settings', requireAuth);
 
 // --- Projects ---
 app.get('/api/projects', async (req, res) => {
-  res.json(await db.all_('SELECT * FROM projects ORDER BY created_at DESC'));
+  try {
+    const role = getSessionRole(req);
+    // Guests only see projects they have explicit access to
+    if (role === 'guest' && req.session.userId) {
+      const rows = await db.all_(
+        'SELECT p.* FROM projects p JOIN project_access pa ON pa.project_id = p.id WHERE pa.user_id = ? ORDER BY p.created_at DESC',
+        [req.session.userId]
+      );
+      return res.json(rows);
+    }
+    // Admin + Accord see all projects
+    res.json(await db.all_('SELECT * FROM projects ORDER BY created_at DESC'));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/projects', async (req, res) => {
@@ -204,29 +472,70 @@ async function generateChatTitle(userMessage, aiReply) {
 
 // --- Chats ---
 app.get('/api/chats', async (req, res) => {
-  const { project_id } = req.query;
-  if (project_id) {
-    res.json(await db.all_('SELECT * FROM chats WHERE project_id = ? ORDER BY updated_at DESC', [project_id]));
-  } else {
-    res.json(await db.all_('SELECT * FROM chats ORDER BY updated_at DESC'));
-  }
+  try {
+    const { project_id } = req.query;
+    const role = getSessionRole(req);
+    const userId = req.session.userId;
+
+    if (role === 'guest' && userId) {
+      // Guests: only chats in their accessible projects
+      if (project_id) {
+        // Verify guest has access to this project
+        const access = await db.get_('SELECT 1 FROM project_access WHERE project_id = ? AND user_id = ?', [project_id, userId]);
+        if (!access) return res.json([]);
+        return res.json(await db.all_('SELECT * FROM chats WHERE project_id = ? ORDER BY updated_at DESC', [project_id]));
+      } else {
+        const rows = await db.all_(
+          'SELECT c.* FROM chats c JOIN project_access pa ON pa.project_id = c.project_id WHERE pa.user_id = ? ORDER BY c.updated_at DESC',
+          [userId]
+        );
+        return res.json(rows);
+      }
+    }
+
+    // Admin + Accord see all
+    if (project_id) {
+      res.json(await db.all_('SELECT * FROM chats WHERE project_id = ? ORDER BY updated_at DESC', [project_id]));
+    } else {
+      res.json(await db.all_('SELECT * FROM chats ORDER BY updated_at DESC'));
+    }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/chats', async (req, res) => {
-  const { project_id, title, telegram_session_key } = req.body;
-  const id = uuidv4(), session_id = `web-${id}`, now = Date.now();
-  await db.run_(
-    'INSERT INTO chats (id, project_id, title, session_id, telegram_session_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [id, project_id || null, title || 'New Chat', session_id, telegram_session_key || null, now, now]
-  );
-  res.json(await db.get_('SELECT * FROM chats WHERE id = ?', [id]));
+  try {
+    const { project_id, title, telegram_session_key } = req.body;
+    const role = getSessionRole(req);
+    const userId = req.session.userId;
+
+    // Guests must specify a project_id they have access to
+    if (role === 'guest' && userId) {
+      if (!project_id) return res.status(403).json({ error: 'Guests must specify a project to create a chat' });
+      const access = await db.get_('SELECT 1 FROM project_access WHERE project_id = ? AND user_id = ?', [project_id, userId]);
+      if (!access) return res.status(403).json({ error: 'No access to this project' });
+    }
+
+    const id = uuidv4(), session_id = `web-${id}`, now = Date.now();
+    await db.run_(
+      'INSERT INTO chats (id, project_id, title, session_id, telegram_session_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [id, project_id || null, title || 'New Chat', session_id, telegram_session_key || null, now, now]
+    );
+    res.json(await db.get_('SELECT * FROM chats WHERE id = ?', [id]));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.put('/api/chats/:id', async (req, res) => {
-  const { title, project_id, telegram_session_key } = req.body;
+  const body = req.body;
+  const current = await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]);
+  if (!current) return res.status(404).json({ error: 'Chat not found' });
+  // Only overwrite project_id / telegram_session_key if explicitly provided in the body
+  // (prevents rename-only calls from nullifying project membership)
+  const title = body.title !== undefined ? body.title : current.title;
+  const project_id = 'project_id' in body ? (body.project_id || null) : current.project_id;
+  const telegram_session_key = 'telegram_session_key' in body ? (body.telegram_session_key || null) : current.telegram_session_key;
   await db.run_(
     'UPDATE chats SET title = ?, project_id = ?, telegram_session_key = ?, updated_at = ? WHERE id = ?',
-    [title, project_id || null, telegram_session_key || null, Date.now(), req.params.id]
+    [title, project_id, telegram_session_key, Date.now(), req.params.id]
   );
   res.json(await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]));
 });
@@ -317,16 +626,34 @@ app.post('/api/chats/:id/send', upload.array('files'), async (req, res) => {
     const chat = await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]);
     if (!chat) return res.status(404).json({ error: 'Chat not found' });
 
-    const { message } = req.body;
+    const { message, voiceAudioPath, voiceAudioFilename, voiceAudioSize } = req.body;
     const files = req.files || [];
     const now = Date.now();
     const attachments = files.map(f => ({ name: f.originalname, path: f.path, size: f.size, mimetype: f.mimetype }));
+    // Voice message: audio was already saved by /api/transcribe; just reference it
+    if (voiceAudioPath && fs.existsSync(voiceAudioPath)) {
+      attachments.unshift({
+        name: voiceAudioFilename || 'voice-message.webm',
+        path: voiceAudioPath,
+        size: parseInt(voiceAudioSize || 0, 10),
+        mimetype: 'audio/webm',
+        isVoice: true,
+      });
+    }
+
+    // Get display name for the user
+    let senderName = null;
+    let senderId = req.session.userId || null;
+    if (senderId) {
+      const senderUser = await db.get_('SELECT display_name FROM users WHERE id = ?', [senderId]);
+      if (senderUser) senderName = senderUser.display_name;
+    }
 
     // Save user message
     const userMsgId = uuidv4();
     await db.run_(
-      'INSERT INTO messages (id, chat_id, role, content, attachments, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [userMsgId, chat.id, 'user', message || '', JSON.stringify(attachments), now]
+      'INSERT INTO messages (id, chat_id, role, content, attachments, created_at, user_id, display_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [userMsgId, chat.id, 'user', message || '', JSON.stringify(attachments), now, senderId, senderName]
     );
 
     // Update chat
@@ -339,58 +666,84 @@ app.post('/api/chats/:id/send', upload.array('files'), async (req, res) => {
       [aiMsgId, chat.id, 'assistant', '...thinking...', '[]', now + 1]
     );
 
+    // Broadcast user message via SSE
+    const userMsg = await db.get_('SELECT * FROM messages WHERE id = ?', [userMsgId]);
+    broadcastToChat(chat.id, 'message', { ...userMsg, attachments: JSON.parse(userMsg.attachments || '[]') });
+    // Broadcast agent-thinking indicator (clear user typing, don't re-broadcast stale user IDs)
+    broadcastToChat(chat.id, 'typing', { users: [], names: [] });
+
     res.json({ userMsgId, aiMsgId, status: 'processing' });
+
+    // Prefix message with sender name for collaborative chats
+    let agentMessage = message || '';
+    const participants = await db.all_('SELECT COUNT(*) as cnt FROM chat_participants WHERE chat_id = ?', [chat.id]);
+    const isCollaborative = participants[0]?.cnt > 1;
+    if (senderName && isCollaborative) {
+      agentMessage = `[From ${senderName}]: ${agentMessage}`;
+    }
 
     // Run agent async — queue if a response is already in flight for this chat
     if (chatGatewayBusy.has(chat.id)) {
-      enqueueMessage(chat, message || '', attachments, aiMsgId);
+      enqueueMessage(chat, agentMessage, attachments, aiMsgId, senderName);
     } else {
       chatGatewayBusy.add(chat.id);
-      runAgent(chat, message, attachments, aiMsgId);
+      broadcastAgentStatus(chat.id, true);
+      runAgent(chat, agentMessage, attachments, aiMsgId);
     }
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// In-process agent runner — we directly import agentCommand instead of
-// going through the CLI path, which avoids stdout/stderr capture issues
-let agentCommandFn = null;
-let agentCommandReady = null;
-function initAgentCommand() {
-  if (agentCommandReady) return agentCommandReady;
-  agentCommandReady = (async () => {
-    try {
-      // Intercept stdout during module load to suppress plugin registration messages
-      const origWrite = process.stdout.write.bind(process.stdout);
-      process.stdout.write = (chunk, encoding, cb) => { return true; };
-      try {
-        const oc = await import('/data/.npm-global/lib/node_modules/openclaw/dist/agent-command-QBBzz2Au.js');
-        agentCommandFn = oc.t;
-        const runtimeMod = await import('/data/.npm-global/lib/node_modules/openclaw/dist/runtime-yzlkhCoS.js');
-        const depsMod = await import('/data/.npm-global/lib/node_modules/openclaw/dist/deps-DynEVk0q.js');
-        // Use createNonExitingRuntime so process.exit() doesn't kill the server
-        const safeRuntime = runtimeMod.t ? runtimeMod.t() : runtimeMod.createNonExitingRuntime();
-        const defaultRuntime = runtimeMod.n || runtimeMod.defaultRuntime;
-        return { agentCommand: agentCommandFn, runtime: safeRuntime, defaultRuntime, deps: depsMod };
-      } finally {
-        process.stdout.write = origWrite;
-      }
-    } catch (e) {
-      console.error('[agent-command] init failed:', e.message);
-      agentCommandReady = null;
-      throw e;
-    }
-  })();
-  return agentCommandReady;
-}
+// --- Voice init: create user + AI placeholder rows WITHOUT running agent yet ---
+app.post('/api/chats/:id/send-voice-init', requireAuth, async (req, res) => {
+  try {
+    const chat = await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]);
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    const now = Date.now();
+    const userMsgId = uuidv4();
+    const aiMsgId = uuidv4();
+    await db.run_(
+      'INSERT INTO messages (id, chat_id, role, content, attachments, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [userMsgId, chat.id, 'user', '\ud83c\udfa4 Transcribing...', '[]', now]
+    );
+    await db.run_(
+      'INSERT INTO messages (id, chat_id, role, content, attachments, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [aiMsgId, chat.id, 'assistant', '...thinking...', '[]', now + 1]
+    );
+    await db.run_('UPDATE chats SET updated_at = ? WHERE id = ?', [now, chat.id]);
+    res.json({ userMsgId, aiMsgId });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-// Pre-warm at startup
-setTimeout(() => {
-  initAgentCommand().then(() => {
-    console.log('[agent-command] Pre-warmed in-process agent command');
-  }).catch(e => {
-    console.error('[agent-command] Pre-warm failed:', e.message);
-  });
-}, 100);
+// --- Voice reply: transcript already exists, AI placeholder already created, just run agent ---
+app.post('/api/chats/:id/send-voice-reply', requireAuth, async (req, res) => {
+  try {
+    const chat = await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]);
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    const { transcript, aiMsgId, audioPath, audioFilename } = req.body;
+    if (!transcript || !aiMsgId) return res.status(400).json({ error: 'Missing transcript or aiMsgId' });
+
+    const attachments = [];
+    if (audioPath && fs.existsSync(audioPath)) {
+      attachments.push({ name: audioFilename || 'voice-message.webm', path: audioPath, mimetype: 'audio/webm', isVoice: true });
+    }
+
+    res.json({ ok: true });
+
+    if (chatGatewayBusy.has(chat.id)) {
+      enqueueMessage(chat, transcript, attachments, aiMsgId, null);
+    } else {
+      chatGatewayBusy.add(chat.id);
+      broadcastAgentStatus(chat.id, true);
+      runAgent(chat, transcript, attachments, aiMsgId).finally(() => {
+        chatGatewayBusy.delete(chat.id);
+        broadcastAgentStatus(chat.id, false);
+        drainQueue(chat.id);
+      });
+    }
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+const OPENCLAW_BIN = '/usr/bin/openclaw';
 
 async function runAgent(chat, userMessage, attachments, aiMsgId) {
   try {
@@ -404,10 +757,20 @@ async function runAgent(chat, userMessage, attachments, aiMsgId) {
     // Prepend project instructions and files
     if (chat.project_id) {
       const project = await db.get_('SELECT * FROM projects WHERE id = ?', [chat.project_id]);
+      if (project && project.guardrails && project.guardrails.trim()) {
+        fullMessage = `[Project guardrails: ${project.guardrails}]\n\n` + fullMessage;
+      }
       if (project && project.instructions) {
         fullMessage = `[Project context: ${project.instructions}]\n\n` + fullMessage;
       }
       if (project) {
+        // Prepend project links (Google Docs/Sheets/Slides/Drive folders)
+        const projectLinks = await db.all_('SELECT * FROM project_links WHERE project_id = ? ORDER BY created_at ASC', [project.id]);
+        if (projectLinks.length > 0) {
+          const linksText = projectLinks.map(l => `- ${l.title} (${l.link_type}): ${l.url}`).join('\n');
+          fullMessage = `[Project linked resources:\n${linksText}]\n\n` + fullMessage;
+        }
+
         const projectFiles = await db.all_('SELECT * FROM project_files WHERE project_id = ?', [project.id]);
         for (const pf of projectFiles) {
           try {
@@ -425,70 +788,59 @@ async function runAgent(chat, userMessage, attachments, aiMsgId) {
     // Derive session key: use chat's telegram_session_key if set, otherwise use chat id
     const sessionKey = chat.telegram_session_key || `web-${chat.id}`;
 
-    // Run the OpenClaw agent in-process via agentCommand (returns result directly)
+    // Run the real OpenClaw agent via CLI — same session store as Telegram
     const reply = await new Promise((resolve, reject) => {
-      const abortController = new AbortController();
-      activeAgentProcesses[chat.id] = { abortController, aiMsgId };
+      const args = [
+        'agent',
+        '--session-id', sessionKey,
+        '--message', fullMessage,
+        '--json'
+      ];
 
-      let done = false;
-      const cleanup = () => {
-        if (done) return;
-        done = true;
-        delete activeAgentProcesses[chat.id];
-      };
+      // Load env from ~/.openclaw/.env
+      const envLines = (() => {
+        try { return fs.readFileSync(path.join(process.env.HOME || '/home/clawdbot', '.openclaw', '.env'), 'utf8').split('\n'); }
+        catch { return []; }
+      })();
+      const extraEnv = {};
+      for (const line of envLines) {
+        const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+        if (m) extraEnv[m[1]] = m[2].replace(/^["']|["']$/g, '');
+      }
 
-      // Safety timeout
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error('Agent execution timed out after 5 minutes'));
-      }, 300000);
-
-      // Allow abort
-      abortController.signal.addEventListener('abort', () => {
-        cleanup();
-        reject(new Error('Agent execution aborted'));
-        clearTimeout(timer);
-      });
-
-      (agentCommandReady || initAgentCommand()).then(async (modules) => {
+      const child = execFile(OPENCLAW_BIN, args, {
+        timeout: 300000, // 5 min
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env, ...extraEnv }
+      }, (err, stdout, stderr) => {
+        delete activeAgentProcesses[chat.id]; // clean up when done
+        if (err && !stdout) return reject(new Error(err.message + (stderr ? '\n' + stderr.slice(0, 500) : '')));
+        // Parse JSON output
         try {
-          const acFn = modules.agentCommand;
-          const runtime = modules.runtime;
-          const deps = modules.deps;
-          
-          const result = await acFn({
-            message: fullMessage,
-            sessionKey: sessionKey,
-            senderIsOwner: true,
-            allowModelOverride: true,
-            abortSignal: abortController.signal
-          }, runtime, deps);
-          
-          clearTimeout(timer);
-          cleanup();
-          
-          // Parse the response — result is deliveryResult with payloads at top level
-          const payloads = result?.payloads || [];
-          if (payloads.length === 0) {
-            resolve(result?.meta?.summary || 'Done.');
-          } else {
-            const texts = payloads.map(p => p.text).filter(Boolean);
-            resolve(texts.join('\n\n') || 'Done.');
-          }
-        } catch (runnerErr) {
-          clearTimeout(timer);
-          cleanup();
-          reject(new Error('Agent error: ' + runnerErr.message));
+          // stdout may have config warnings before JSON
+          const jsonStart = stdout.indexOf('{');
+          if (jsonStart < 0) return reject(new Error('No JSON in agent output: ' + stdout.slice(0, 300)));
+          const result = JSON.parse(stdout.slice(jsonStart));
+          if (result.status !== 'ok') return reject(new Error('Agent status: ' + result.status));
+          const texts = (result.result?.payloads || []).map(p => p.text).filter(Boolean);
+          resolve(texts.join('\n\n') || 'Done.');
+        } catch (parseErr) {
+          // Fallback: return raw stdout stripped of config warnings
+          const clean = stdout.replace(/^Config warnings:[\s\S]*?\n\n/m, '').trim();
+          resolve(clean || 'Done.');
         }
-      }).catch((initErr) => {
-        clearTimeout(timer);
-        cleanup();
-        reject(new Error('Agent init failed: ' + initErr.message));
       });
+      activeAgentProcesses[chat.id] = { child, aiMsgId };
     });
 
     await db.run_('UPDATE messages SET content = ? WHERE id = ?', [reply, aiMsgId]);
     await db.run_('UPDATE chats SET updated_at = ? WHERE id = ?', [Date.now(), chat.id]);
+
+    // Broadcast new message via SSE
+    const aiMsg = await db.get_('SELECT * FROM messages WHERE id = ?', [aiMsgId]);
+    broadcastToChat(chat.id, 'message', { ...aiMsg, attachments: JSON.parse(aiMsg.attachments || '[]') });
+    // Clear agent-thinking indicator
+    broadcastToChat(chat.id, 'typing', { users: [], names: [] });
 
     // Auto-title: generate after first AI reply if still 'New Chat'
     try {
@@ -504,12 +856,341 @@ async function runAgent(chat, userMessage, attachments, aiMsgId) {
   } catch (e) {
     console.error('runAgent error:', e);
     await db.run_('UPDATE messages SET content = ? WHERE id = ?', [`Error: ${e.message}`, aiMsgId]);
+    // Broadcast error message via SSE so other users see it
+    try {
+      const errMsg = await db.get_('SELECT * FROM messages WHERE id = ?', [aiMsgId]);
+      if (errMsg) broadcastToChat(chat.id, 'message', { ...errMsg, attachments: [] });
+    } catch {}
   } finally {
     // Always release busy lock and drain queue, no matter what
     chatGatewayBusy.delete(chat.id);
+    broadcastAgentStatus(chat.id, false);
     drainQueue(chat.id);
   }
 }
+
+// --- Project settings (admin/accord only) ---
+app.get('/api/projects/:id/settings', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  try {
+    const project = await db.get_('SELECT * FROM projects WHERE id = ?', [req.params.id]);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    const members = await db.all_(
+      'SELECT u.id, u.email, u.display_name, u.role, pa.granted_at FROM users u JOIN project_access pa ON pa.user_id = u.id WHERE pa.project_id = ?',
+      [req.params.id]
+    );
+    res.json({ project, members });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/projects/:id/guardrails', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  try {
+    const { guardrails } = req.body;
+    await db.run_('UPDATE projects SET guardrails = ? WHERE id = ?', [guardrails || '', req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Admin panel routes ---
+
+// List all users
+app.get('/api/admin/users', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  try {
+    const users = await db.all_('SELECT id, email, display_name, role, active, created_at FROM users ORDER BY created_at ASC');
+    res.json(users);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Invite new user
+app.post('/api/admin/users/invite', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  try {
+    const { email, role, display_name } = req.body;
+    if (!email || !role) return res.status(400).json({ error: 'Email and role required' });
+    const existing = await db.get_('SELECT id FROM users WHERE email = ?', [email.toLowerCase().trim()]);
+    if (existing) return res.status(409).json({ error: 'User with this email already exists' });
+
+    const crypto = require('crypto');
+    const tempPassword = crypto.randomBytes(8).toString('hex');
+    const passwordHash = await bcrypt.hash(tempPassword, 10);
+    const id = uuidv4();
+    const inviterId = req.session.userId || 'legacy';
+    await db.run_(
+      'INSERT INTO users (id, email, display_name, password_hash, role, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [id, email.toLowerCase().trim(), display_name || email.split('@')[0], passwordHash, role, Date.now(), inviterId]
+    );
+
+    // Send invite email via Gmail API
+    try {
+      const { google } = require('googleapis');
+      const creds = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.openclaw', 'workspace', 'google-creds.json')));
+      const tokenData = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.openclaw', 'workspace', 'google-token.json')));
+      const installed = creds.installed || creds.web || creds;
+      const oauth2 = new google.auth.OAuth2(
+        installed.client_id, installed.client_secret,
+        (installed.redirect_uris || ['urn:ietf:wg:oauth:2.0:oob'])[0]
+      );
+      oauth2.setCredentials(tokenData);
+      const gmail = google.gmail({ version: 'v1', auth: oauth2 });
+      const rawEmail = [
+        'From: ' + (process.env.ADMIN_EMAIL || 'admin@example.com') + '',
+        `To: ${email}`,
+        'Content-Type: text/plain; charset=utf-8',
+        'Subject: You\'ve been invited to Antar',
+        '',
+        `You've been invited at https://your-agent-url\n\nYour temporary password is: ${tempPassword}\n\nPlease log in and change your password in Settings.`
+      ].join('\r\n');
+      await gmail.users.messages.send({ userId: 'me', requestBody: { raw: Buffer.from(rawEmail).toString('base64url') } });
+      console.log(`[admin] Invite email sent to ${email}`);
+    } catch (mailErr) {
+      console.error('[admin] Failed to send invite email:', mailErr.message);
+    }
+
+    // Audit: user invite
+    const actorUser = req.session.userId ? await db.get_('SELECT email FROM users WHERE id = ?', [req.session.userId]) : null;
+    await writeAuditLog({ actorUserId: req.session.userId || 'legacy', actorEmail: actorUser?.email || 'legacy', action: 'user_invite', target: email, details: { role } });
+
+    res.json({ ok: true, id, tempPassword });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Update user (display_name, role, active)
+app.put('/api/admin/users/:id', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  try {
+    const { display_name, role, active } = req.body;
+    const user = await db.get_('SELECT * FROM users WHERE id = ?', [req.params.id]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const newDisplayName = display_name !== undefined ? display_name : user.display_name;
+    const newRole = role !== undefined ? role : user.role;
+    const newActive = active !== undefined ? (active ? 1 : 0) : user.active;
+    await db.run_('UPDATE users SET display_name = ?, role = ?, active = ? WHERE id = ?',
+      [newDisplayName, newRole, newActive, req.params.id]);
+
+    // Audit logging
+    const actorUser = req.session.userId ? await db.get_('SELECT email FROM users WHERE id = ?', [req.session.userId]) : null;
+    const actorId = req.session.userId || 'legacy';
+    const actorEmail = actorUser?.email || 'legacy';
+    if (role !== undefined && role !== user.role) {
+      await writeAuditLog({ actorUserId: actorId, actorEmail, action: 'role_change', target: user.email, details: { from: user.role, to: newRole } });
+    }
+    if (active !== undefined && (active ? 1 : 0) !== user.active) {
+      const action = newActive ? 'user_reactivated' : 'user_deactivated';
+      await writeAuditLog({ actorUserId: actorId, actorEmail, action, target: user.email });
+    }
+
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get guest permissions
+app.get('/api/admin/guest-permissions/:userId', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  try {
+    const perms = await db.all_('SELECT * FROM guest_permissions WHERE user_id = ?', [req.params.userId]);
+    res.json(perms);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Set guest permissions
+app.put('/api/admin/guest-permissions/:userId', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  try {
+    const { permissions } = req.body; // Array of { permission, requires_approval }
+    const userId = req.params.userId;
+    const granterId = req.session.userId || 'legacy';
+    // Get old permissions for audit diff
+    const oldPerms = await db.all_('SELECT permission FROM guest_permissions WHERE user_id = ?', [userId]);
+    const oldSet = new Set(oldPerms.map(p => p.permission));
+    const newSet = new Set((permissions || []).map(p => p.permission));
+    // Clear existing permissions for this user
+    await db.run_('DELETE FROM guest_permissions WHERE user_id = ?', [userId]);
+    // Insert new ones
+    for (const p of (permissions || [])) {
+      await db.run_(
+        'INSERT INTO guest_permissions (user_id, permission, granted_by, granted_at, requires_approval) VALUES (?, ?, ?, ?, ?)',
+        [userId, p.permission, granterId, Date.now(), p.requires_approval || null]
+      );
+    }
+    // Audit: log grants and revocations
+    const targetUser = await db.get_('SELECT email FROM users WHERE id = ?', [userId]);
+    const actorUser = granterId !== 'legacy' ? await db.get_('SELECT email FROM users WHERE id = ?', [granterId]) : null;
+    const actorEmail = actorUser?.email || 'legacy';
+    for (const perm of newSet) {
+      if (!oldSet.has(perm)) {
+        await writeAuditLog({ actorUserId: granterId, actorEmail, action: 'permission_grant', target: targetUser?.email || userId, details: { permission: perm } });
+      }
+    }
+    for (const perm of oldSet) {
+      if (!newSet.has(perm)) {
+        await writeAuditLog({ actorUserId: granterId, actorEmail, action: 'permission_revoke', target: targetUser?.email || userId, details: { permission: perm } });
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// List all project access
+app.get('/api/admin/project-access', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  try {
+    const rows = await db.all_(
+      `SELECT pa.project_id, pa.user_id, pa.granted_at,
+              p.name AS project_name, u.email, u.display_name, u.role
+       FROM project_access pa
+       JOIN projects p ON p.id = pa.project_id
+       JOIN users u ON u.id = pa.user_id
+       ORDER BY p.name, u.email`
+    );
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Grant project access
+app.post('/api/admin/project-access', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  try {
+    const { project_id, user_id } = req.body;
+    if (!project_id || !user_id) return res.status(400).json({ error: 'project_id and user_id required' });
+    const granterId = req.session.userId || 'legacy';
+    await db.run_(
+      'INSERT OR IGNORE INTO project_access (project_id, user_id, granted_by, granted_at) VALUES (?, ?, ?, ?)',
+      [project_id, user_id, granterId, Date.now()]
+    );
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Revoke project access
+app.delete('/api/admin/project-access/:projectId/:userId', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  try {
+    await db.run_('DELETE FROM project_access WHERE project_id = ? AND user_id = ?',
+      [req.params.projectId, req.params.userId]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Audit log (admin + accord)
+app.get('/api/admin/audit-log', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  try {
+    const rows = await db.all_('SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 200');
+    res.json(rows.map(r => ({ ...r, details: r.details ? JSON.parse(r.details) : null })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PM2 status (admin only)
+app.get('/api/admin/pm2-status', requireAuth, requireRole('admin'), async (req, res) => {
+  exec('pm2 list --json', (err, stdout) => {
+    try {
+      const data = JSON.parse(stdout || '[]');
+      res.json({ ok: true, processes: data });
+    } catch {
+      res.json({ ok: false, raw: stdout, error: err?.message });
+    }
+  });
+});
+
+// PM2 restart (admin only)
+app.post('/api/admin/pm2-restart', requireAuth, requireRole('admin'), async (req, res) => {
+  exec('pm2 restart openclaw-web', (err, stdout, stderr) => {
+    res.json({ ok: !err, stdout, stderr, error: err?.message });
+  });
+});
+
+// Server log (admin only)
+app.get('/api/admin/server-log', requireAuth, requireRole('admin'), async (req, res) => {
+  exec('pm2 logs openclaw-web --lines 100 --nostream --no-color 2>&1 || tail -100 /tmp/openclaw-web.log 2>/dev/null || echo "No log available"', (err, stdout) => {
+    res.json({ ok: true, log: stdout || '' });
+  });
+});
+
+// Deploy (admin only)
+app.post('/api/admin/deploy', requireAuth, requireRole('admin'), async (req, res) => {
+  const cmd = 'cd /home/clawdbot/openclaw-web && git pull && pm2 restart openclaw-web';
+  exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+    res.json({ ok: !err, stdout, stderr, error: err?.message });
+  });
+});
+
+// Publish routes removed in public build
+
+// --- Invite guest directly to a project (creates user + grants access + emails) ---
+app.post('/api/projects/:id/invite-guest', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  try {
+    const { email, role, display_name } = req.body;
+    if (!email || !role) return res.status(400).json({ error: 'Email and role required' });
+    const projectId = req.params.id;
+    const project = await db.get_('SELECT id, name FROM projects WHERE id = ?', [projectId]);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+
+    const crypto = require('crypto');
+    const inviterId = req.session.userId || 'legacy';
+    const cleanEmail = email.toLowerCase().trim();
+
+    let userId;
+    let isNew = false;
+    const existing = await db.get_('SELECT id, active FROM users WHERE email = ?', [cleanEmail]);
+    if (existing) {
+      // User already exists — just grant project access
+      userId = existing.id;
+      if (existing.active === 0) {
+        // Reactivate if deactivated
+        await db.run_('UPDATE users SET active = 1 WHERE id = ?', [userId]);
+      }
+    } else {
+      // Create new user
+      const tempPassword = crypto.randomBytes(8).toString('hex');
+      const passwordHash = await bcrypt.hash(tempPassword, 10);
+      userId = uuidv4();
+      await db.run_(
+        'INSERT INTO users (id, email, display_name, password_hash, role, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [userId, cleanEmail, display_name || cleanEmail.split('@')[0], passwordHash, role || 'guest', Date.now(), inviterId]
+      );
+      isNew = true;
+
+      // Send invite email
+      try {
+        const { google } = require('googleapis');
+        const creds = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.openclaw', 'workspace', 'google-creds.json')));
+        const tokenData = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.openclaw', 'workspace', 'google-token.json')));
+        const installed = creds.installed || creds.web || creds;
+        const oauth2 = new google.auth.OAuth2(
+          installed.client_id, installed.client_secret,
+          (installed.redirect_uris || ['urn:ietf:wg:oauth:2.0:oob'])[0]
+        );
+        oauth2.setCredentials(tokenData);
+        const gmail = google.gmail({ version: 'v1', auth: oauth2 });
+        const rawEmail = [
+          'From: ' + (process.env.ADMIN_EMAIL || 'admin@example.com') + '',
+          `To: ${cleanEmail}`,
+          'Content-Type: text/plain; charset=utf-8',
+          `Subject: You've been invited to the "${project.name}" project on Antar`,
+          '',
+          `You've been invited to collaborate on the "${project.name}" project on OpenClaw Web.\n\nURL: https://your-agent-url\nEmail: ${cleanEmail}\nTemporary password: ${tempPassword}\n\nPlease log in and change your password in Settings.`
+        ].join('\r\n');
+        await gmail.users.messages.send({ userId: 'me', requestBody: { raw: Buffer.from(rawEmail).toString('base64url') } });
+        console.log(`[project-invite] Invite email sent to ${cleanEmail}`);
+      } catch (mailErr) {
+        console.error('[project-invite] Failed to send invite email:', mailErr.message);
+      }
+
+      await writeAuditLog({ actorUserId: inviterId, actorEmail: (await db.get_('SELECT email FROM users WHERE id = ?', [inviterId]))?.email || 'legacy', action: 'user_invite', target: cleanEmail, details: { role, via: 'project_invite', project: project.name } });
+    }
+
+    // Grant project access
+    await db.run_(
+      'INSERT OR IGNORE INTO project_access (project_id, user_id, granted_by, granted_at) VALUES (?, ?, ?, ?)',
+      [projectId, userId, inviterId, Date.now()]
+    );
+
+    const user = await db.get_('SELECT id, email, display_name, role FROM users WHERE id = ?', [userId]);
+    res.json({ ok: true, isNew, user });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// List project members (admin/accord only)
+app.get('/api/projects/:id/members', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  try {
+    const members = await db.all_(
+      'SELECT u.id, u.email, u.display_name, u.role, pa.granted_at FROM users u JOIN project_access pa ON pa.user_id = u.id WHERE pa.project_id = ?',
+      [req.params.id]
+    );
+    res.json(members);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // --- Project files ---
 app.get('/api/projects/:id/files', async (req, res) => {
@@ -546,6 +1227,50 @@ app.delete('/api/projects/:id/files/:fileId', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// --- Project Links ---
+app.get('/api/projects/:id/links', requireAuth, async (req, res) => {
+  try {
+    const links = await db.all_('SELECT * FROM project_links WHERE project_id = ? ORDER BY created_at ASC', [req.params.id]);
+    res.json(links);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/projects/:id/links', requireAuth, async (req, res) => {
+  try {
+    const project = await db.get_('SELECT id FROM projects WHERE id = ?', [req.params.id]);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    const { url, title, link_type } = req.body;
+    if (!url) return res.status(400).json({ error: 'url is required' });
+    const id = require('crypto').randomUUID();
+    await db.run_('INSERT INTO project_links (id, project_id, url, title, link_type, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [id, req.params.id, url, title || url, link_type || 'doc', Date.now()]);
+    res.json(await db.get_('SELECT * FROM project_links WHERE id = ?', [id]));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/projects/:id/links/:linkId', requireAuth, async (req, res) => {
+  try {
+    const link = await db.get_('SELECT * FROM project_links WHERE id = ? AND project_id = ?', [req.params.linkId, req.params.id]);
+    if (!link) return res.status(404).json({ error: 'Link not found' });
+    await db.run_('DELETE FROM project_links WHERE id = ?', [link.id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Chat agent status (for initial sync on page load) ---
+app.get('/api/chats/:id/agent-status', requireAuth, async (req, res) => {
+  const chatId = req.params.id;
+  const busy = chatGatewayBusy.has(chatId);
+  const queue = chatQueueMeta.get(chatId) || [];
+  // Also find the in-flight aiMsgId (the ...thinking... message)
+  let thinkingMsgId = null;
+  if (busy) {
+    const proc = activeAgentProcesses[chatId];
+    if (proc) thinkingMsgId = proc.aiMsgId;
+  }
+  res.json({ busy, queue, thinkingMsgId });
+});
+
 // --- Get single message (for polling) ---
 app.get('/api/messages/:id', async (req, res) => {
   const msg = await db.get_('SELECT * FROM messages WHERE id = ?', [req.params.id]);
@@ -567,77 +1292,38 @@ app.patch('/api/messages/:id', requireAuth, async (req, res) => {
   res.json({ ...msg, attachments: JSON.parse(msg.attachments || '[]') });
 });
 
-
-// --- Voice message: create placeholder rows (no agent call yet) ---
-app.post('/api/chats/:id/send-voice-init', requireAuth, async (req, res) => {
-  try {
-    const chat = await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]);
-    if (!chat) return res.status(404).json({ error: 'Chat not found' });
-    const now = Date.now();
-    const userMsgId = uuidv4();
-    const aiMsgId = uuidv4();
-    await db.run_(
-      'INSERT INTO messages (id, chat_id, role, content, attachments, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [userMsgId, chat.id, 'user', '🎤 Transcribing...', '[]', now]
-    );
-    await db.run_(
-      'INSERT INTO messages (id, chat_id, role, content, attachments, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [aiMsgId, chat.id, 'assistant', '...thinking...', '[]', now + 1]
-    );
-    await db.run_('UPDATE chats SET updated_at = ? WHERE id = ?', [now, chat.id]);
-    res.json({ userMsgId, aiMsgId });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// --- Voice reply: transcript exists, placeholder created, just run agent ---
-app.post('/api/chats/:id/send-voice-reply', requireAuth, async (req, res) => {
-  try {
-    const chat = await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]);
-    if (!chat) return res.status(404).json({ error: 'Chat not found' });
-    const { transcript, aiMsgId, audioPath, audioFilename } = req.body;
-    if (!transcript || !aiMsgId) return res.status(400).json({ error: 'Missing transcript or aiMsgId' });
-
-    const attachments = [];
-    if (audioPath && fs.existsSync(audioPath)) {
-      attachments.push({ name: audioFilename || 'voice-message.webm', path: audioPath, mimetype: 'audio/webm', isVoice: true });
-    }
-
-    res.json({ ok: true });
-
-    if (chatGatewayBusy.has(chat.id)) {
-      enqueueMessage(chat, transcript, attachments, aiMsgId);
-    } else {
-      chatGatewayBusy.add(chat.id);
-      runAgent(chat, transcript, attachments, aiMsgId).finally(() => {
-        chatGatewayBusy.delete(chat.id);
-        drainQueue(chat.id);
-      });
-    }
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 // --- Transcribe audio ---
 app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No audio file' });
+  console.log(`[transcribe] received file: ${req.file.originalname}, size: ${req.file.size}, path: ${req.file.path}`);
   try {
     const OpenAI = require('openai');
-    // Get API key from env
+    // Whisper must go to real OpenAI, not the LiteLLM proxy
     const apiKey = process.env.OPENAI_API_KEY || process.env.LITELLM_API_KEY;
     if (!apiKey) return res.status(500).json({ error: 'No OpenAI API key configured' });
-    const openai = new OpenAI({ apiKey });
+    const openai = new OpenAI({ apiKey, baseURL: 'https://api.openai.com/v1', timeout: 120000 });
+    console.log(`[transcribe] calling whisper...`);
     const transcription = await openai.audio.transcriptions.create({
       file: fs.createReadStream(req.file.path),
       model: 'whisper-1',
     });
-    res.json({ text: transcription.text });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    console.log(`[transcribe] success: "${transcription.text.slice(0, 80)}"`);
+    res.json({
+      text: transcription.text,
+      audioPath: req.file.path,
+      audioFilename: path.basename(req.file.path),
+      audioSize: req.file.size,
+    });
+  } catch (e) {
+    console.error(`[transcribe] error:`, e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
-
 
 // --- Serve uploaded audio files ---
 app.get('/api/audio/:filename', requireAuth, (req, res) => {
-  const filePath = require('path').join(UPLOAD_DIR, req.params.filename);
-  if (!require('fs').existsSync(filePath)) return res.status(404).json({ error: 'Audio not found' });
+  const filePath = path.join(UPLOAD_DIR, req.params.filename);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Audio not found' });
   res.setHeader('Content-Type', 'audio/webm');
   res.sendFile(filePath);
 });
@@ -689,12 +1375,42 @@ app.get('/api/share/:token', async (req, res) => {
 });
 
 // --- Settings ---
+app.put('/api/settings/profile', requireAuth, async (req, res) => {
+  try {
+    const { display_name } = req.body;
+    if (!display_name || !display_name.trim()) return res.status(400).json({ error: 'Display name required' });
+    if (req.session.userId) {
+      await db.run_('UPDATE users SET display_name = ? WHERE id = ?', [display_name.trim(), req.session.userId]);
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.put('/api/settings/password', async (req, res) => {
-  const { password } = req.body;
-  if (!password || password.length < 6) return res.status(400).json({ error: 'Password too short' });
-  const hash = bcrypt.hashSync(password, 10);
-  await db.run_('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['password_hash', hash]);
-  res.json({ ok: true });
+  try {
+    const { password, current_password, new_password } = req.body;
+    // New-style: current_password + new_password
+    if (current_password !== undefined && new_password !== undefined) {
+      if (!new_password || new_password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+      if (req.session.userId) {
+        const user = await db.get_('SELECT * FROM users WHERE id = ?', [req.session.userId]);
+        if (!user || !bcrypt.compareSync(current_password, user.password_hash)) {
+          return res.status(401).json({ error: 'Current password is incorrect' });
+        }
+        const hash = await bcrypt.hash(new_password, 10);
+        await db.run_('UPDATE users SET password_hash = ? WHERE id = ?', [hash, req.session.userId]);
+        // Also update settings table for backward compat
+        await db.run_('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['password_hash', hash]);
+        return res.json({ ok: true });
+      }
+    }
+    // Old-style: password field only
+    const pw = password || new_password;
+    if (!pw || pw.length < 6) return res.status(400).json({ error: 'Password too short' });
+    const hash = bcrypt.hashSync(pw, 10);
+    await db.run_('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['password_hash', hash]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // --- Workflows ---
@@ -829,7 +1545,8 @@ app.post('/api/chats/:id/abort', requireAuth, async (req, res) => {
   const proc = activeAgentProcesses[chatId];
   if (proc) {
     try {
-      proc.abortController.abort();
+      proc.child.kill('SIGTERM');
+      setTimeout(() => { try { proc.child.kill('SIGKILL'); } catch {} }, 2000);
     } catch {}
     delete activeAgentProcesses[chatId];
     if (proc.aiMsgId) {
@@ -839,6 +1556,381 @@ app.post('/api/chats/:id/abort', requireAuth, async (req, res) => {
   } else {
     res.json({ ok: true, aborted: false });
   }
+});
+
+// ============================================================
+// --- Phase 3: SSE, Typing, Invite, Participants Routes ---
+// ============================================================
+
+// SSE stream endpoint
+app.get('/api/chats/:id/stream', requireAuth, (req, res) => {
+  const chatId = req.params.id;
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  // Send heartbeat comment every 25s
+  const heartbeat = setInterval(() => {
+    try { res.write(': heartbeat\n\n'); } catch {}
+  }, 25000);
+
+  // Register client
+  if (!chatSSEClients.has(chatId)) chatSSEClients.set(chatId, new Set());
+  chatSSEClients.get(chatId).add(res);
+
+  // Send connected event
+  res.write(`event: connected\ndata: ${JSON.stringify({ chatId })}\n\n`);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    const clients = chatSSEClients.get(chatId);
+    if (clients) {
+      clients.delete(res);
+      if (clients.size === 0) chatSSEClients.delete(chatId);
+    }
+  });
+});
+
+// Typing indicator
+app.post('/api/chats/:id/typing', requireAuth, async (req, res) => {
+  try {
+    const chatId = req.params.id;
+    const userId = req.session.userId || 'legacy';
+    if (!typingUsers.has(chatId)) typingUsers.set(chatId, new Map());
+    typingUsers.get(chatId).set(userId, Date.now());
+    // Get display names for typing users
+    const userIds = Array.from(typingUsers.get(chatId).keys());
+    const names = [];
+    for (const uid of userIds) {
+      const u = await db.get_('SELECT display_name FROM users WHERE id = ?', [uid]);
+      if (u) names.push(u.display_name);
+    }
+    broadcastToChat(chatId, 'typing', { users: userIds, names });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Open chat (generate invite)
+app.post('/api/chats/:id/open', requireAuth, async (req, res) => {
+  try {
+    const chat = await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]);
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    const userId = req.session.userId || 'legacy';
+    // Must be owner or admin
+    const role = getSessionRole(req);
+    if (chat.owner_id && chat.owner_id !== userId && role !== 'admin' && role !== 'accord') {
+      return res.status(403).json({ error: 'Only the chat owner can open it for collaboration' });
+    }
+    // Set owner if not set
+    if (!chat.owner_id) {
+      await db.run_('UPDATE chats SET owner_id = ? WHERE id = ?', [userId, req.params.id]);
+    }
+    // Invalidate old tokens
+    await db.run_('UPDATE chat_invites SET active = 0 WHERE chat_id = ?', [req.params.id]);
+    // Create new invite token
+    const crypto = require('crypto');
+    const token = crypto.randomBytes(16).toString('hex');
+    await db.run_(
+      'INSERT INTO chat_invites (token, chat_id, created_by, created_at, active) VALUES (?, ?, ?, ?, 1)',
+      [token, req.params.id, userId, Date.now()]
+    );
+    // Ensure owner is in chat_participants
+    await db.run_(
+      'INSERT OR IGNORE INTO chat_participants (chat_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)',
+      [req.params.id, userId, 'owner', Date.now()]
+    );
+    await db.run_('UPDATE chats SET is_open = 1 WHERE id = ?', [req.params.id]);
+    res.json({ ok: true, token, inviteUrl: `https://your-agent-url/join/${token}` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Close chat
+app.post('/api/chats/:id/close', requireAuth, async (req, res) => {
+  try {
+    const chat = await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]);
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    const userId = req.session.userId || 'legacy';
+    const role = getSessionRole(req);
+    if (chat.owner_id && chat.owner_id !== userId && role !== 'admin' && role !== 'accord') {
+      return res.status(403).json({ error: 'Only the chat owner can close it' });
+    }
+    await db.run_('UPDATE chat_invites SET active = 0 WHERE chat_id = ?', [req.params.id]);
+    await db.run_('UPDATE chats SET is_open = 0 WHERE id = ?', [req.params.id]);
+    broadcastToChat(req.params.id, 'chat_closed', { chatId: req.params.id });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get all platform users with participant status for this chat (owner/admin/accord only)
+app.get('/api/chats/:id/all-users', requireAuth, async (req, res) => {
+  try {
+    const chat = await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]);
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    const requesterId = req.session.userId || 'legacy';
+    const role = getSessionRole(req);
+    const isOwner = !chat.owner_id || chat.owner_id === requesterId;
+    if (!isOwner && role !== 'admin' && role !== 'accord') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const users = await db.all_(`
+      SELECT u.id, u.display_name, u.email, u.role,
+             CASE WHEN cp.user_id IS NOT NULL THEN 1 ELSE 0 END as is_participant
+      FROM users u
+      LEFT JOIN chat_participants cp ON cp.user_id = u.id AND cp.chat_id = ?
+      WHERE u.active = 1
+      ORDER BY u.display_name ASC
+    `, [req.params.id]);
+    res.json(users);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Add participant directly (owner/admin/accord only)
+app.post('/api/chats/:id/participants', requireAuth, async (req, res) => {
+  try {
+    const chat = await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]);
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    const requesterId = req.session.userId || 'legacy';
+    const role = getSessionRole(req);
+    const isOwner = !chat.owner_id || chat.owner_id === requesterId;
+    if (!isOwner && role !== 'admin' && role !== 'accord') {
+      return res.status(403).json({ error: 'Only the chat owner can add participants' });
+    }
+    // Claim ownership if unclaimed
+    if (!chat.owner_id) {
+      await db.run_('UPDATE chats SET owner_id = ? WHERE id = ?', [requesterId, req.params.id]);
+    }
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    // Ensure chat is open
+    await db.run_('UPDATE chats SET is_open = 1 WHERE id = ?', [req.params.id]);
+    await db.run_(
+      'INSERT OR IGNORE INTO chat_participants (chat_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)',
+      [req.params.id, userId, 'member', Date.now()]
+    );
+    const user = await db.get_('SELECT display_name FROM users WHERE id = ?', [userId]);
+    broadcastToChat(req.params.id, 'participant_joined', { userId, displayName: user?.display_name });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get chat participants
+app.get('/api/chats/:id/participants', requireAuth, async (req, res) => {
+  try {
+    const rows = await db.all_(
+      `SELECT cp.user_id, cp.role, cp.joined_at, u.display_name, u.email
+       FROM chat_participants cp
+       JOIN users u ON u.id = cp.user_id
+       WHERE cp.chat_id = ?`,
+      [req.params.id]
+    );
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Remove participant (owner only)
+app.delete('/api/chats/:id/participants/:userId', requireAuth, async (req, res) => {
+  try {
+    const chat = await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]);
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    const requesterId = req.session.userId || 'legacy';
+    const role = getSessionRole(req);
+    const isOwner = !chat.owner_id || chat.owner_id === requesterId;
+    if (!isOwner && role !== 'admin' && role !== 'accord') {
+      return res.status(403).json({ error: 'Only the chat owner can remove participants' });
+    }
+    await db.run_('DELETE FROM chat_participants WHERE chat_id = ? AND user_id = ?',
+      [req.params.id, req.params.userId]);
+    const user = await db.get_('SELECT display_name FROM users WHERE id = ?', [req.params.userId]);
+    broadcastToChat(req.params.id, 'participant_left', { userId: req.params.userId, displayName: user?.display_name });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Join via invite link
+app.get('/join/:token', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.post('/api/join/:token', requireAuth, async (req, res) => {
+  try {
+    const invite = await db.get_('SELECT * FROM chat_invites WHERE token = ? AND active = 1', [req.params.token]);
+    if (!invite) return res.status(404).json({ error: 'Invalid or expired invite link' });
+    const userId = req.session.userId;
+    if (!userId) return res.status(401).json({ error: 'Must be logged in to join' });
+    // Add to participants
+    await db.run_(
+      'INSERT OR IGNORE INTO chat_participants (chat_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)',
+      [invite.chat_id, userId, 'member', Date.now()]
+    );
+    const user = await db.get_('SELECT display_name FROM users WHERE id = ?', [userId]);
+    broadcastToChat(invite.chat_id, 'participant_joined', { userId, displayName: user?.display_name });
+    const chat = await db.get_('SELECT id, title FROM chats WHERE id = ?', [invite.chat_id]);
+    res.json({ ok: true, chatId: invite.chat_id, chatTitle: chat?.title });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get active invite for a chat
+app.get('/api/chats/:id/invite', requireAuth, async (req, res) => {
+  try {
+    const invite = await db.get_('SELECT * FROM chat_invites WHERE chat_id = ? AND active = 1 ORDER BY created_at DESC LIMIT 1', [req.params.id]);
+    if (!invite) return res.json({ token: null });
+    res.json({ token: invite.token, inviteUrl: `https://your-agent-url/join/${invite.token}` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ============================================================
+// Phase 4: Guest Permission Approval Flow
+// ============================================================
+
+// POST /api/chats/:id/request-action — guest requests to use a skill/workflow/mcp
+app.post('/api/chats/:id/request-action', requireAuth, async (req, res) => {
+  try {
+    const role = getSessionRole(req);
+    if (role !== 'guest') return res.status(403).json({ error: 'This endpoint is for guests only' });
+
+    const chatId = req.params.id;
+    const userId = req.session.userId;
+    const { permission, actionName, actionPayload } = req.body;
+    if (!permission || !actionName) return res.status(400).json({ error: 'permission and actionName required' });
+
+    // Verify chat exists and guest has access
+    const chat = await db.get_('SELECT * FROM chats WHERE id = ?', [chatId]);
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+
+    // Check guest_permissions
+    const perm = await db.get_('SELECT * FROM guest_permissions WHERE user_id = ? AND permission = ?', [userId, permission]);
+    if (!perm) {
+      return res.json({ blocked: true, reason: 'no_permission', message: 'You do not have permission to run this action.' });
+    }
+
+    if (!perm.requires_approval) {
+      return res.json({ allowed: true });
+    }
+
+    // Requires approval — create record and system message
+    const approvalId = uuidv4();
+    const now = Date.now();
+    await db.run_(
+      `INSERT INTO permission_approvals (id, chat_id, guest_user_id, permission, action_name, action_payload, requires_approval, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      [approvalId, chatId, userId, permission, actionName, actionPayload || '', perm.requires_approval, now]
+    );
+
+    // Insert system message
+    const sysMsgId = uuidv4();
+    await db.run_(
+      'INSERT INTO messages (id, chat_id, role, content, attachments, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [sysMsgId, chatId, 'system', `[APPROVAL_REQUEST:${approvalId}]`, '[]', now]
+    );
+    await db.run_('UPDATE chats SET updated_at = ? WHERE id = ?', [now, chatId]);
+
+    // Get guest display name
+    const guestUser = await db.get_('SELECT display_name FROM users WHERE id = ?', [userId]);
+    const guestName = guestUser?.display_name || 'Guest';
+
+    broadcastToChat(chatId, 'approval_request', {
+      approvalId, guestName, permission, actionName, requiresApproval: perm.requires_approval
+    });
+
+    return res.json({
+      allowed: false, pending: true, approvalId,
+      message: 'Approval requested. You will be notified when an admin reviews your request.'
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/approvals/:id/approve
+app.post('/api/approvals/:id/approve', requireAuth, async (req, res) => {
+  try {
+    const approvalId = req.params.id;
+    const callerId = req.session.userId || 'legacy';
+    const callerRole = getSessionRole(req);
+
+    if (callerRole !== 'admin' && callerRole !== 'accord') {
+      return res.status(403).json({ error: 'Forbidden: must be admin or accord' });
+    }
+
+    const approval = await db.get_('SELECT * FROM permission_approvals WHERE id = ?', [approvalId]);
+    if (!approval) return res.status(404).json({ error: 'Approval not found' });
+    if (approval.status !== 'pending') return res.status(400).json({ error: 'Approval already decided' });
+
+    // accord can only approve if requires_approval === 'accord'
+    if (callerRole === 'accord' && approval.requires_approval !== 'accord') {
+      return res.status(403).json({ error: 'Forbidden: only admin can approve this request' });
+    }
+
+    const now = Date.now();
+    await db.run_(
+      `UPDATE permission_approvals SET status='approved', decided_by=?, decided_at=? WHERE id=?`,
+      [callerId, now, approvalId]
+    );
+
+    // Update system message
+    await db.run_(
+      `UPDATE messages SET content=? WHERE chat_id=? AND content=?`,
+      [`[APPROVAL_RESULT:${approvalId}:approved]`, approval.chat_id, `[APPROVAL_REQUEST:${approvalId}]`]
+    );
+    await db.run_('UPDATE chats SET updated_at = ? WHERE id = ?', [now, approval.chat_id]);
+
+    broadcastToChat(approval.chat_id, 'approval_decision', {
+      approvalId, status: 'approved', decidedBy: callerId,
+      actionPayload: approval.action_payload, guestUserId: approval.guest_user_id
+    });
+
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/approvals/:id/deny
+app.post('/api/approvals/:id/deny', requireAuth, async (req, res) => {
+  try {
+    const approvalId = req.params.id;
+    const callerId = req.session.userId || 'legacy';
+    const callerRole = getSessionRole(req);
+
+    if (callerRole !== 'admin' && callerRole !== 'accord') {
+      return res.status(403).json({ error: 'Forbidden: must be admin or accord' });
+    }
+
+    const approval = await db.get_('SELECT * FROM permission_approvals WHERE id = ?', [approvalId]);
+    if (!approval) return res.status(404).json({ error: 'Approval not found' });
+    if (approval.status !== 'pending') return res.status(400).json({ error: 'Approval already decided' });
+
+    if (callerRole === 'accord' && approval.requires_approval !== 'accord') {
+      return res.status(403).json({ error: 'Forbidden: only admin can deny this request' });
+    }
+
+    const now = Date.now();
+    await db.run_(
+      `UPDATE permission_approvals SET status='denied', decided_by=?, decided_at=? WHERE id=?`,
+      [callerId, now, approvalId]
+    );
+
+    await db.run_(
+      `UPDATE messages SET content=? WHERE chat_id=? AND content=?`,
+      [`[APPROVAL_RESULT:${approvalId}:denied]`, approval.chat_id, `[APPROVAL_REQUEST:${approvalId}]`]
+    );
+    await db.run_('UPDATE chats SET updated_at = ? WHERE id = ?', [now, approval.chat_id]);
+
+    broadcastToChat(approval.chat_id, 'approval_decision', {
+      approvalId, status: 'denied', decidedBy: callerId, guestUserId: approval.guest_user_id
+    });
+
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/approvals/:id
+app.get('/api/approvals/:id', requireAuth, async (req, res) => {
+  try {
+    const approval = await db.get_('SELECT * FROM permission_approvals WHERE id = ?', [req.params.id]);
+    if (!approval) return res.status(404).json({ error: 'Approval not found' });
+    // Also get guest display name
+    const guest = await db.get_('SELECT display_name FROM users WHERE id = ?', [approval.guest_user_id]);
+    res.json({ ...approval, guest_display_name: guest?.display_name || 'Guest' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // --- SPA catch-all: serve index.html for any non-API, non-share, non-static path ---
@@ -856,8 +1948,8 @@ const httpServer = http.createServer(app);
 
 httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🤖 OpenClaw Web UI`);
-  console.log(`   Web UI running on port 8080`);
-  console.log(`   Default password: changeme123\n`);
+  console.log(`   https://your-agent-url (via Cloudflare Tunnel)`);
+  console.log(`   Default password: changeme123!\n`);
 });
 
 process.on('SIGTERM', () => { db.close(); process.exit(0); });
