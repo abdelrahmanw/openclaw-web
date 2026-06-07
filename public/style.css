@@ -482,6 +482,32 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
   border-left: 1px solid var(--border);
 }
 
+#core-panel {
+  width: 0;
+  min-width: 0;
+  background: var(--sidebar-bg);
+  border-left: none;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow: hidden;
+  transition: width 0.25s ease, min-width 0.25s ease, border-left 0.25s ease;
+  position: relative;
+}
+#core-panel.open {
+  width: var(--panel-width);
+  min-width: var(--panel-width);
+  border-left: 1px solid var(--border);
+}
+#core-viewer {
+  position: absolute;
+  inset: 0;
+  background: var(--sidebar-bg);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 #skills-panel {
   width: 0;
   min-width: 0;
@@ -826,6 +852,18 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
     overflow: hidden;
   }
   #workflows-panel.open {
+    position: fixed;
+    right: 0; top: 0; bottom: 0;
+    z-index: 20;
+    width: 100vw !important;
+    min-width: 0 !important;
+  }
+  #core-panel {
+    width: 0 !important;
+    min-width: 0 !important;
+    overflow: hidden;
+  }
+  #core-panel.open {
     position: fixed;
     right: 0; top: 0; bottom: 0;
     z-index: 20;

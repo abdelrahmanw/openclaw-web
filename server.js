@@ -1702,6 +1702,45 @@ app.get('/api/skills', requireAuth, (req, res) => {
   res.json(skills);
 });
 
+// --- Core files API ---
+const WORKSPACE_ROOT = path.join(process.env.HOME || '/home/clawdbot', '.openclaw', 'workspace');
+const CORE_FILES = [
+  { name: 'SOUL',      file: 'SOUL.md',      desc: 'Personality & identity' },
+  { name: 'USER',      file: 'USER.md',       desc: 'Owner profile' },
+  { name: 'MEMORY',    file: 'MEMORY.md',     desc: 'Working memory' },
+  { name: 'AGENTS',    file: 'AGENTS.md',     desc: 'Fleet & behaviour rules' },
+  { name: 'TOOLS',     file: 'TOOLS.md',      desc: 'Tool setup & credentials' },
+  { name: 'HEARTBEAT', file: 'HEARTBEAT.md',  desc: 'Scheduled tasks' },
+  { name: 'IDENTITY',  file: 'IDENTITY.md',   desc: 'Bot identity config' },
+];
+
+app.get('/api/core', requireAuth, (req, res) => {
+  const result = CORE_FILES.map(item => {
+    const filePath = path.join(WORKSPACE_ROOT, item.file);
+    return {
+      name: item.name,
+      file: item.file,
+      desc: item.desc,
+      path: filePath,
+      exists: fs.existsSync(filePath),
+    };
+  }).filter(item => item.exists);
+  res.json(result);
+});
+
+app.get('/api/core/content', requireAuth, (req, res) => {
+  const { filePath } = req.query;
+  if (!filePath) return res.status(400).json({ error: 'filePath required' });
+  // Security: must be workspace root, no subdirectory traversal
+  const resolved = path.resolve(filePath);
+  if (path.dirname(resolved) !== WORKSPACE_ROOT) return res.status(403).json({ error: 'Forbidden' });
+  if (!fs.existsSync(resolved)) return res.status(404).json({ error: 'Not found' });
+  try {
+    const content = fs.readFileSync(resolved, 'utf8');
+    res.json({ content });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/skills/content', requireAuth, (req, res) => {
   const { skillPath } = req.query;
   if (!skillPath) return res.status(400).json({ error: 'skillPath required' });

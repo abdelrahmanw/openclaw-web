@@ -97,6 +97,7 @@
             <button class="tools-menu-item" onclick="toggleArtifactPanel(); closeToolsMenu()">Artifacts</button>
             <button class="tools-menu-item" onclick="toggleWorkflowsPanel(); closeToolsMenu()" id="workflows-toggle-btn">Workflows</button>
             <button class="tools-menu-item" onclick="toggleSkillsPanel(); closeToolsMenu()" id="skills-toggle-btn">Skills</button>
+            <button class="tools-menu-item" onclick="toggleCorePanel(); closeToolsMenu()" id="core-toggle-btn">Core</button>
             <hr class="tools-menu-divider"/>
             <button class="tools-menu-item" onclick="renameAllChats(); closeToolsMenu()" id="rename-all-btn">✨ Rename All</button>
             <button class="tools-menu-item" onclick="toggleTheme(); closeToolsMenu()" id="theme-toggle-btn">🌙 Theme</button>
@@ -129,7 +130,7 @@
         <div class="input-attachments" id="input-attachments"></div>
         <div class="input-row" id="input-row">
           <button class="input-btn followup-btn" onclick="sendFollowUp()" title="Follow Up">Follow Up</button>
-          <textarea id="msg-input" placeholder="Message your agent..." rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+          <textarea id="msg-input" placeholder="Message..." rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
           <input type="file" id="file-input" multiple style="display:none" onchange="handleFiles(this.files)"/>
           <button class="input-btn" onclick="document.getElementById('file-input').click()" title="Attach file">📎</button>
           <button class="input-btn record" id="record-btn" onclick="toggleRecord()" title="Voice message">🎤</button>
@@ -170,6 +171,22 @@
       <div class="skills-viewer-name" id="workflows-viewer-name"></div>
     </div>
     <div class="skills-viewer-body" id="workflows-viewer-body"></div>
+  </div>
+  </div>
+
+  <!-- Core Panel (inside #app so it compresses chat on open) -->
+  <div id="core-panel">
+  <div class="skills-header">
+    <div class="skills-title">Core Files</div>
+    <button class="artifact-close" onclick="toggleCorePanel()">✕</button>
+  </div>
+  <div class="skills-list" id="core-list"><div class="skills-loading">Loading...</div></div>
+  <div id="core-viewer" style="display:none">
+    <div class="skills-viewer-header">
+      <button class="skills-back-btn" onclick="closeCoreViewer()">← Back</button>
+      <div class="skills-viewer-name" id="core-viewer-name"></div>
+    </div>
+    <div class="skills-viewer-body" id="core-viewer-body"></div>
   </div>
   </div>
 

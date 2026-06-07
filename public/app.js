@@ -165,16 +165,19 @@ let state = {
 // === Init ===
 window.addEventListener('DOMContentLoaded', async () => {
   initTheme();
-  // Load instance name for tab title and sidebar logo
+  // Load instance name for tab title, sidebar logo, and input placeholder
   try {
     const cfg = await api('/api/app-config');
     const name = cfg.instanceName || 'My Agent';
+    window._instanceName = name;
     const titleEl = document.getElementById('page-title');
     if (titleEl) titleEl.textContent = name;
     const sidebarName = document.getElementById('sidebar-instance-name');
     if (sidebarName) sidebarName.textContent = name;
     const loginName = document.getElementById('login-instance-name');
     if (loginName) loginName.textContent = name;
+    const msgInput = document.getElementById('msg-input');
+    if (msgInput) msgInput.placeholder = `Message ${name}...`;
   } catch (e) { /* keep defaults */ }
   // Handle /reset-password SPA route
   if (window.location.pathname === '/reset-password') {
@@ -2096,7 +2099,8 @@ function updatePanelOpenClass() {
   const artifactOpen = document.getElementById('artifact-panel').classList.contains('open');
   const skillsOpen = document.getElementById('skills-panel').classList.contains('open');
   const workflowsOpen = document.getElementById('workflows-panel').classList.contains('open');
-  document.getElementById('app').classList.toggle('panel-open', artifactOpen || skillsOpen || workflowsOpen);
+  const coreOpen = document.getElementById('core-panel').classList.contains('open');
+  document.getElementById('app').classList.toggle('panel-open', artifactOpen || skillsOpen || workflowsOpen || coreOpen);
 }
 
 // === Artifacts ===
@@ -2107,6 +2111,7 @@ function toggleArtifactPanel() {
   // Close other panels if opening artifact panel (avoid double-panel on smaller screens)
   if (willOpen) document.getElementById('skills-panel').classList.remove('open');
   if (willOpen) document.getElementById('workflows-panel').classList.remove('open');
+  if (willOpen) document.getElementById('core-panel').classList.remove('open');
   if (willOpen) {
     if (state.artifacts.length) {
       showArtifact(state.currentArtifactIdx >= 0 && state.currentArtifactIdx < state.artifacts.length ? state.currentArtifactIdx : 0);
@@ -2753,6 +2758,7 @@ function toggleSkillsPanel() {
   panel.classList.toggle('open');
   if (willOpen) document.getElementById('artifact-panel').classList.remove('open');
   if (willOpen) document.getElementById('workflows-panel').classList.remove('open');
+  if (willOpen) document.getElementById('core-panel').classList.remove('open');
   if (willOpen && !skillsLoaded) loadSkills();
   updatePanelOpenClass();
 }
@@ -2760,6 +2766,97 @@ function toggleSkillsPanel() {
 function closeSkillsPanel() {
   document.getElementById('skills-panel').classList.remove('open');
   updatePanelOpenClass();
+}
+
+
+// === Core Files Panel ===
+let coreLoaded = false;
+let allCoreFiles = [];
+let activeCoreFilePath = null;
+
+function toggleCorePanel() {
+  const panel = document.getElementById('core-panel');
+  const willOpen = !panel.classList.contains('open');
+  panel.classList.toggle('open');
+  if (willOpen) document.getElementById('artifact-panel').classList.remove('open');
+  if (willOpen) document.getElementById('workflows-panel').classList.remove('open');
+  if (willOpen) document.getElementById('skills-panel').classList.remove('open');
+  if (willOpen && !coreLoaded) loadCoreFiles();
+  updatePanelOpenClass();
+}
+
+function closeCorePanel() {
+  document.getElementById('core-panel').classList.remove('open');
+  updatePanelOpenClass();
+}
+
+// --- Load core files from API ---
+async function loadCoreFiles() {
+  try {
+    allCoreFiles = await api('/api/core');
+    coreLoaded = true;
+    renderCoreList(allCoreFiles);
+  } catch (e) {
+    document.getElementById('core-list').innerHTML =
+      `<div class="skills-loading" style="color:var(--danger)">Failed to load core files: ${esc(e.message)}</div>`;
+  }
+}
+
+// --- Render core files list ---
+function renderCoreList(files) {
+  const el = document.getElementById('core-list');
+  if (!files.length) {
+    el.innerHTML = '<div class="skills-loading">No core files found.</div>';
+    return;
+  }
+  let html = '';
+  files.forEach(item => {
+    const active = activeCoreFilePath === item.path ? 'active' : '';
+    html += `<div class="skill-item ${active}" data-core-path="${esc(item.path)}" data-core-name="${esc(item.name)}" onclick="handleCoreItemClick(this)">
+      <div class="skill-item-name">${esc(item.name)}</div>
+      ${item.desc ? `<div class="skill-item-desc">${esc(item.desc)}</div>` : ''}
+    </div>`;
+  });
+  el.innerHTML = html;
+}
+
+// --- Handle click on a core list item (uses data-attrs to avoid quoting issues) ---
+function handleCoreItemClick(el) {
+  const filePath = el.dataset.corePath;
+  const fileName = el.dataset.coreName;
+  if (filePath && fileName) openCoreFile(filePath, fileName);
+}
+
+// --- Open a core file in viewer ---
+async function openCoreFile(filePath, fileName) {
+  activeCoreFilePath = filePath;
+  renderCoreList(allCoreFiles); // refresh active state
+
+  const viewer = document.getElementById('core-viewer');
+  const body = document.getElementById('core-viewer-body');
+  const nameEl = document.getElementById('core-viewer-name');
+
+  document.getElementById('core-list').style.display = 'none';
+  viewer.style.display = 'flex';
+  nameEl.textContent = fileName;
+  body.innerHTML = '<div class="skills-loading"><span class="spinner"></span> Loading...</div>';
+
+  try {
+    const res = await api(`/api/core/content?filePath=${encodeURIComponent(filePath)}`);
+    const content = res.content || '';
+    body.innerHTML = `<div class="skills-viewer-md">${marked.parse(content)}</div>`;
+    if (window.hljs) body.querySelectorAll('pre code').forEach(b => hljs.highlightElement(b));
+  } catch (e) {
+    body.innerHTML = `<div class="skills-loading" style="color:var(--danger)">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+// --- Close viewer, back to list ---
+function closeCoreViewer() {
+  activeCoreFilePath = null;
+  document.getElementById('core-viewer').style.display = 'none';
+  document.getElementById('core-list').style.display = '';
+  renderCoreList(allCoreFiles);
 }
 
 // --- Load skills from API ---
