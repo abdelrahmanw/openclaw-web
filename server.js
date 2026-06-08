@@ -949,6 +949,19 @@ async function runAgent(chat, userMessage, attachments, aiMsgId) {
     // Clear agent-thinking indicator
     broadcastToChat(chat.id, 'typing', { users: [], names: [] });
 
+    // Inject completion into the OpenClaw session so webchat surfaces it even on background turns.
+    // Fire-and-forget — never block the main response path on this.
+    (() => {
+      const sessionKey = chat.telegram_session_key || `web-${chat.id}`;
+      // Only inject for web sessions (Telegram has its own delivery path)
+      if (!sessionKey.startsWith('web-')) return;
+      const gw = createGatewayClient();
+      gw.ready
+        .then(() => gw.request('chat.inject', { sessionKey, message: reply }))
+        .catch(() => {}) // best-effort; never throw
+        .finally(() => { try { gw.close(); } catch {} });
+    })();
+
     // Auto-title: generate after first AI reply if still 'New Chat'
     try {
       const freshChat = await db.get_('SELECT title FROM chats WHERE id = ?', [chat.id]);

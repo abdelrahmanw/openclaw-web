@@ -1133,22 +1133,21 @@ async function sendMessage() {
   startLegacyPoll(chatId, res.aiMsgId);
 }
 
-// Legacy poll fallback (used for file uploads and SSE errors)
-function startLegacyPoll(chatId, aiMsgId) {
-  state.chatThinkingMsgId[chatId] = aiMsgId; // track which message is in-flight
-  startThinkingCycle();
-  const interval = setInterval(async () => {
-    if (!state.pendingPolls[chatId]) return;
-    let msg;
-    try { msg = await api(`/api/messages/${aiMsgId}`); } catch { return; }
-    if (msg.content !== '...thinking...' && msg.content !== '') {
-      clearPollInterval(chatId);
-      playDing();
-      stopThinkingCycle();
-      const isViewing = state.currentChat?.id === chatId;
-      const chatTitle = state.chats.find(c => c.id === chatId)?.title || 'Chat';
-      showCompletionToast(isViewing ? '✓ Replied' : `✓ Reply ready in "${chatTitle}"`);
-      if (!isViewing && Notification.permission === 'granted') {
+// Shared completion handler — idempotent, called by SSE or poll, whichever fires first.
+async function handleAgentComplete(chatId) {
+  // Guard: if poll is already cleared, SSE already handled this — do nothing.
+  if (!hasPendingPoll(chatId) && !state.chatAgentBusy[chatId]) return;
+  clearPollInterval(chatId);
+  playDing();
+  stopThinkingCycle();
+  const isViewing = state.currentChat?.id === chatId;
+  const chatTitle = state.chats.find(c => c.id === chatId)?.title || 'Chat';
+  showCompletionToast(isViewing ? '✓ Replied' : `✓ Reply ready in "${chatTitle}"`);
+  if (!isViewing && Notification.permission === 'granted') {
+    try {
+      const msg = await api(`/api/chats/${chatId}/messages`).then(msgs => msgs?.slice(-1)[0]).catch(() => null)
+        || await api(`/api/messages/${state.chatThinkingMsgId[chatId]}`).catch(() => null);
+      if (msg && msg.content && msg.content !== '...thinking...') {
         const preview = msg.content.replace(/[#*`_~]/g, '').slice(0, 100);
         const notif = new Notification(`Reply ready in "${chatTitle}"`, {
           body: preview,
@@ -1157,34 +1156,41 @@ function startLegacyPoll(chatId, aiMsgId) {
         });
         notif.onclick = () => { window.focus(); notif.close(); openChat(chatId); };
       }
-      await new Promise(r => setTimeout(r, 700));
-      const fresh = await api('/api/chats');
-      state.chats = fresh; renderSidebar();
-      if (state.currentChat?.id === chatId) {
-        state.currentChat = state.chats.find(c => c.id === chatId) || state.currentChat;
-        pushChatURL(state.currentChat);
-        document.getElementById('chat-title').innerHTML = getChatDisplayTitleHTML(state.currentChat);
-        await loadMessages(); scrollToBottom();
-        updateStopBtn(chatId); processNextQueueItem(chatId);
-      } else { markChatReplied(chatId); updateStopBtn(chatId); }
+    } catch {}
+  }
+  const fresh = await api('/api/chats').catch(() => null);
+  if (fresh) { state.chats = fresh; renderSidebar(); }
+  if (state.currentChat?.id === chatId) {
+    state.currentChat = state.chats.find(c => c.id === chatId) || state.currentChat;
+    pushChatURL(state.currentChat);
+    document.getElementById('chat-title').innerHTML = getChatDisplayTitleHTML(state.currentChat);
+    await loadMessages(); scrollToBottom();
+    updateStopBtn(chatId); processNextQueueItem(chatId);
+  } else { markChatReplied(chatId); updateStopBtn(chatId); }
+}
+
+// Legacy poll fallback — only fires if SSE agent_status didn't already handle completion.
+function startLegacyPoll(chatId, aiMsgId) {
+  state.chatThinkingMsgId[chatId] = aiMsgId; // track which message is in-flight
+  startThinkingCycle();
+  const interval = setInterval(async () => {
+    if (!state.pendingPolls[chatId]) return;
+    // If SSE already marked agent done, the poll is redundant — bail out.
+    if (state.chatAgentBusy[chatId] === false) { handleAgentComplete(chatId); return; }
+    let msg;
+    try { msg = await api(`/api/messages/${aiMsgId}`); } catch { return; }
+    if (msg.content !== '...thinking...' && msg.content !== '') {
+      await handleAgentComplete(chatId);
     }
   }, 1500);
-  // Watchdog: if SSE misses the busy=false event, recover after 150s
+  // Watchdog: if SSE misses the busy=false event entirely, recover after 150s
   const watchdog = setTimeout(async function tickWatchdog() {
     const p = state.pendingPolls[chatId];
     if (!p || p.aiMsgId !== aiMsgId) return; // already cleared
     try {
       const msg = await api(`/api/messages/${aiMsgId}`);
       if (msg && msg.content !== '...thinking...' && msg.content !== '') {
-        // Response already written — SSE missed the done signal
-        clearPollInterval(chatId);
-        playDing();
-        stopThinkingCycle();
-        const isViewing = state.currentChat?.id === chatId;
-        const chatTitle = state.chats.find(c => c.id === chatId)?.title || 'Chat';
-        showCompletionToast(isViewing ? '✓ Replied' : `✓ Reply ready in "${chatTitle}"`);
-        if (isViewing) { await loadMessages(); scrollToBottom(); }
-        else { markChatReplied(chatId); }
+        await handleAgentComplete(chatId);
         return;
       }
     } catch {}
@@ -4472,17 +4478,8 @@ function connectChatSSE(chatId) {
       if (data.busy) {
         if (state.currentChat?.id === chatId) startThinkingCycle();
       } else {
-        // Only stop thinking cycle if we don't have a local poll running
-        if (!hasPendingPoll(chatId)) {
-          if (state.currentChat?.id === chatId) stopThinkingCycle();
-        }
-        // Clear synthetic poll if agent finished
-        const p = state.pendingPolls[chatId];
-        if (p && p.synthetic) clearPollInterval(chatId);
-        if (state.currentChat?.id === chatId) {
-          updateStopBtn(chatId);
-          processNextQueueItem(chatId);
-        }
+        // SSE is the authoritative completion signal — always handle it.
+        await handleAgentComplete(chatId);
       }
       // Re-render messages so thinking state updates correctly
       if (state.currentChat?.id === chatId) {
