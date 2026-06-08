@@ -435,6 +435,27 @@ function startGlobalEventStream() {
     updateNotificationBadge();
   });
 
+  // Listen for agent_status on the global event stream — catches completions
+  // for background chats whose chat-specific SSE may have dropped.
+  // The server sends agent_status on both the chat-specific stream AND the
+  // global stream (with chatId in the payload).
+  es.addEventListener('agent_status', async (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      if (!data.chatId) return;
+      // Only process if this chat's SSE is NOT currently active (otherwise
+      // the chat-specific SSE handler will take care of it and we'd double-fire)
+      if (state.chatSSE.has(data.chatId)) return;
+      
+      state.chatAgentBusy[data.chatId] = !!data.busy;
+      state.chatThinkingMsgId[data.chatId] = data.busy ? (data.thinkingMsgId || null) : null;
+      
+      if (!data.busy) {
+        await handleAgentComplete(data.chatId);
+      }
+    } catch {}
+  });
+
   es.addEventListener('chat_created', e => {
     try {
       const { chat } = JSON.parse(e.data);
@@ -1258,8 +1279,33 @@ async function sendMessage() {
 
 // Shared completion handler — idempotent, called by SSE or poll, whichever fires first.
 async function handleAgentComplete(chatId) {
-  // Guard: if poll is already cleared, SSE already handled this — do nothing.
-  if (!hasPendingPoll(chatId) && !state.chatAgentBusy[chatId]) return;
+  // Guard: if poll is already cleared AND agent is not busy, this is a redundant call.
+  // However, there's a subtle case: SSE reconnected and sent busy:false, which cleared
+  // chatAgentBusy but the poll may still be active from before the reconnect (the poll
+  // interval is separate from the SSE). In that case, hasPendingPoll is still true and
+  // we should proceed. Only skip if BOTH are cleared.
+  if (!hasPendingPoll(chatId) && !state.chatAgentBusy[chatId]) {
+    // Extra safety: check if there's a thinking message that never got resolved
+    const thinkingId = state.chatThinkingMsgId[chatId];
+    if (thinkingId) {
+      // Force check the server — this catches cases where the SSE reconnect
+      // reset our state but the thinking message is still stuck on ...thinking...
+      try {
+        const msg = await api(`/api/messages/${thinkingId}`).catch(() => null);
+        if (msg && msg.content && msg.content !== '...thinking...' && msg.content !== '') {
+          // The agent actually completed — proceed with cleanup
+          state.chatAgentBusy[chatId] = false;
+          state.chatThinkingMsgId[chatId] = null;
+        } else {
+          return;
+        }
+      } catch {
+        return;
+      }
+    } else {
+      return;
+    }
+  }
   clearPollInterval(chatId);
   playDing();
   stopThinkingCycle();
@@ -4563,10 +4609,18 @@ const typingPingLastSent = new Map();
 const sseBackoffState = new Map();
 
 function connectChatSSE(chatId) {
-  // Close any existing SSE for a different chat
-  state.chatSSE.forEach((es, cid) => { if (cid !== chatId) { try { es.close(); } catch {} state.chatSSE.delete(cid); } });
   // Don't reconnect if already open for this chat
+  // NOTE: We NO LONGER close SSE connections for other chats!
+  // Background chats keep their SSE alive so they can receive agent_status events.
   if (state.chatSSE.has(chatId)) return;
+  // But do close SSE for chats that are no longer in the sidebar (deleted/closed)
+  const currentIds = new Set((state.chats || []).map(c => c.id));
+  state.chatSSE.forEach((es, cid) => {
+    if (!currentIds.has(cid)) {
+      try { es.close(); } catch {}
+      state.chatSSE.delete(cid);
+    }
+  });
 
   // Reset backoff if this is a fresh connection request (not a retry)
   if (!sseBackoffState.has(chatId)) sseBackoffState.set(chatId, { retries: 0 });
@@ -4587,13 +4641,18 @@ function connectChatSSE(chatId) {
     }
   }, 20000);
 
-  es.onopen = () => {
+  es.onopen = async () => {
     // Reset backoff and heartbeat clock on successful connection
     lastHeartbeatAt = Date.now();
     sseBackoffState.set(chatId, { retries: 0 });
     // Hide reconnecting indicator if shown
     const ind = document.getElementById('sse-reconnect-indicator');
     if (ind) ind.style.display = 'none';
+    // RECONNECT RECOVERY: If we reconnected but the agent was already done,
+    // the server will send us an explicit busy:false in the state sync.
+    // That event fires asynchronously via the EventSource, so we just need
+    // to make sure handleAgentComplete catches it.
+    // No additional action needed here — the server state sync handles it.
   };
 
   es.addEventListener('heartbeat', () => {
@@ -4610,16 +4669,22 @@ function connectChatSSE(chatId) {
   es.addEventListener('agent_status', async (e) => {
     try {
       const data = JSON.parse(e.data);
-      state.chatAgentBusy[chatId] = !!data.busy;
-      state.chatThinkingMsgId[chatId] = data.busy ? (data.thinkingMsgId || null) : null;
+      // The event may come from the chat-specific SSE (chatId is the SSE's chatId)
+      // or from the global event stream (data.chatId tells us which chat)
+      const targetChatId = data.chatId || chatId;
+      if (!targetChatId) return;
+      
+      state.chatAgentBusy[targetChatId] = !!data.busy;
+      state.chatThinkingMsgId[targetChatId] = data.busy ? (data.thinkingMsgId || null) : null;
+      
       if (data.busy) {
-        if (state.currentChat?.id === chatId) startThinkingCycle();
+        if (state.currentChat?.id === targetChatId) startThinkingCycle();
       } else {
         // SSE is the authoritative completion signal — always handle it.
-        await handleAgentComplete(chatId);
+        await handleAgentComplete(targetChatId);
       }
       // Re-render messages so thinking state updates correctly
-      if (state.currentChat?.id === chatId) {
+      if (state.currentChat?.id === targetChatId) {
         await loadMessages(); scrollToBottom();
       }
     } catch {}

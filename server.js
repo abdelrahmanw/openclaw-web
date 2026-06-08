@@ -125,7 +125,16 @@ function broadcastAgentStatus(chatId, busy, explicitAiMsgId) {
   const proc = activeAgentProcesses[chatId];
   // Use explicit id (for the pre-runAgent broadcast), then fall back to active process
   const thinkingMsgId = busy ? (explicitAiMsgId || (proc ? proc.aiMsgId : null)) : null;
-  broadcastToChat(chatId, 'agent_status', { busy, thinkingMsgId });
+  const payload = { busy, thinkingMsgId, chatId };
+  // Always broadcast to chat-specific SSE first
+  broadcastToChat(chatId, 'agent_status', payload);
+  // ALSO broadcast to all global user-event SSE streams so background-chat users see it
+  // Include chatId so the client can route the event to the right chat
+  for (const [uid, clients] of userSSEClients) {
+    if (!clients || clients.size === 0) continue;
+    const payloadStr = `event: agent_status\ndata: ${JSON.stringify(payload)}\n\n`;
+    clients.forEach(res => { try { res.write(payloadStr); } catch {} });
+  }
 }
 
 function enqueueMessage(chat, message, attachments, aiMsgId, senderName) {
@@ -1265,6 +1274,40 @@ app.post('/api/admin/project-access', requireAuth, requireRole('admin', 'accord'
       'INSERT OR IGNORE INTO project_access (project_id, user_id, granted_by, granted_at) VALUES (?, ?, ?, ?)',
       [project_id, user_id, granterId, Date.now()]
     );
+
+    // Send email notification to the user
+    try {
+      const user = await db.get_('SELECT email, display_name FROM users WHERE id = ?', [user_id]);
+      const project = await db.get_('SELECT name FROM projects WHERE id = ?', [project_id]);
+      if (user && project) {
+        const { sendEmail } = require('./email');
+        const { name: _instanceName, url: _instanceUrl } = getInstanceConfig();
+        const projectLink = `${_instanceUrl}/p/${project_id}`;
+        await sendEmail({
+          to: user.email,
+          subject: `You've been added to the "${project.name}" project on ${_instanceName}`,
+          body: [
+            `You've been added to collaborate on the "${project.name}" project on ${_instanceName}.`,
+            '',
+            `Project URL: ${projectLink}`,
+            `Email: ${user.email}`,
+            '',
+            'Log in with your existing password to access the project.'
+          ].join('\n'),
+          bodyHtml: `
+            <div style="font-family:Arial,sans-serif;font-size:15px;line-height:1.5;color:#111827">
+              <p>You've been added to collaborate on the <strong>${project.name}</strong> project on <strong>${_instanceName}</strong>.</p>
+              <p><strong>Project:</strong> <a href="${projectLink}">${projectLink}</a><br>
+              <strong>Email:</strong> ${user.email}</p>
+              <p>Log in with your existing password to access the project.</p>
+            </div>`
+        });
+        console.log(`[project-access] Email sent to ${user.email} for project ${project.name}`);
+      }
+    } catch (mailErr) {
+      console.error('[project-access] Failed to send email:', mailErr.message);
+    }
+
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1359,11 +1402,39 @@ app.post('/api/projects/:id/invite-guest', requireAuth, requireRole('admin', 'ac
     let isNew = false;
     const existing = await db.get_('SELECT id, active FROM users WHERE email = ?', [cleanEmail]);
     if (existing) {
-      // User already exists — just grant project access
+      // User already exists — grant project access + send email notification
       userId = existing.id;
       if (existing.active === 0) {
         // Reactivate if deactivated
         await db.run_('UPDATE users SET active = 1 WHERE id = ?', [userId]);
+      }
+      // Send notification email to existing user
+      try {
+        const { sendEmail } = require('./email');
+        const { name: _instanceName, url: _instanceUrl } = getInstanceConfig();
+        const projectLink = `${_instanceUrl}/p/${projectId}`;
+        await sendEmail({
+          to: cleanEmail,
+          subject: `You've been added to the "${project.name}" project on ${_instanceName}`,
+          body: [
+            `You've been added to collaborate on the "${project.name}" project on ${_instanceName}.`,
+            '',
+            `Project URL: ${projectLink}`,
+            `Email: ${cleanEmail}`,
+            '',
+            'Log in with your existing password to access the project.'
+          ].join('\n'),
+          bodyHtml: `
+            <div style="font-family:Arial,sans-serif;font-size:15px;line-height:1.5;color:#111827">
+              <p>You've been added to collaborate on the <strong>${project.name}</strong> project on <strong>${_instanceName}</strong>.</p>
+              <p><strong>Project:</strong> <a href="${projectLink}">${projectLink}</a><br>
+              <strong>Email:</strong> ${cleanEmail}</p>
+              <p>Log in with your existing password to access the project.</p>
+            </div>`
+        });
+        console.log(`[project-invite] Re-invite email sent to ${cleanEmail}`);
+      } catch (mailErr) {
+        console.error('[project-invite] Failed to send re-invite email:', mailErr.message);
       }
     } else {
       // Create new user
@@ -1380,22 +1451,23 @@ app.post('/api/projects/:id/invite-guest', requireAuth, requireRole('admin', 'ac
       try {
         const { sendEmail } = require('./email');
         const { name: _instanceName, url: _instanceUrl } = getInstanceConfig();
+        const projectLink = `${_instanceUrl}/p/${projectId}`;
         await sendEmail({
           to: cleanEmail,
           subject: `You've been invited to the "${project.name}" project on ${_instanceName}`,
           body: [
             `You've been invited to collaborate on the "${project.name}" project on ${_instanceName}.`,
             '',
-            `URL: ${_instanceUrl}`,
+            `Project URL: ${projectLink}`,
             `Email: ${cleanEmail}`,
             `Temporary password: ${tempPassword}`,
             '',
-            'Please log in and change your password in Settings.'
+            'Please log in, then access the project from your dashboard.'
           ].join('\n'),
           bodyHtml: `
             <div style="font-family:Arial,sans-serif;font-size:15px;line-height:1.5;color:#111827">
               <p>You've been invited to collaborate on the <strong>${project.name}</strong> project on <strong>${_instanceName}</strong>.</p>
-              <p><strong>URL:</strong> <a href="${_instanceUrl}">${_instanceUrl}</a><br>
+              <p><strong>Project:</strong> <a href="${projectLink}">${projectLink}</a><br>
               <strong>Email:</strong> ${cleanEmail}<br>
               <strong>Temporary password:</strong> <code style="font-size:16px">${tempPassword}</code></p>
               <p>Please log in and change your password in Settings.</p>
@@ -1707,14 +1779,15 @@ app.post('/api/projects/:id/resend-invite/:userId', requireAuth, async (req, res
 
     const { sendEmail } = require('./email');
     const config = getInstanceConfig();
+    const projectLink = `${config.url}/p/${req.params.id}`;
     let bodyHtml = `<p>You've been invited to collaborate on the project <strong>${project.name}</strong> on ${config.name}.</p>`;
-    let body = `You've been invited to collaborate on the project "${project.name}" on ${config.name}.\n\nURL: ${config.url}`;
+    let body = `You've been invited to collaborate on the project "${project.name}" on ${config.name}.\n\nProject URL: ${projectLink}`;
     if (tempPassword) {
-      body += `\nEmail: ${user.email}\nTemporary password: ${tempPassword}`;
-      bodyHtml += `<p>URL: <a href="${config.url}">${config.url}</a></p><p>Email: ${user.email}</p><p>Temporary password: <strong>${tempPassword}</strong></p>`;
+      body += `\nEmail: ${user.email}\nTemporary password: ${tempPassword}\n\nPlease log in and change your password.`;
+      bodyHtml += `<p><strong>Project:</strong> <a href="${projectLink}">${projectLink}</a></p><p>Email: ${user.email}</p><p>Temporary password: <strong>${tempPassword}</strong></p><p>Please log in and change your password.</p>`;
     } else {
-      body += `\nLog in at: ${config.url}`;
-      bodyHtml += `<p>URL: <a href="${config.url}">${config.url}</a></p>`;
+      body += `\n\nLog in with your existing password to access the project.`;
+      bodyHtml += `<p><strong>Project:</strong> <a href="${projectLink}">${projectLink}</a></p>`;
     }
     await sendEmail({ to: user.email, subject: `Project Invite: ${project.name}`, body, bodyHtml });
     res.json({ ok: true });
@@ -1743,14 +1816,15 @@ app.post('/api/chats/:id/resend-invite/:userId', requireAuth, async (req, res) =
 
     const { sendEmail } = require('./email');
     const config = getInstanceConfig();
+    const chatLink = `${config.url}/c/${req.params.id}`;
     let bodyHtml = `<p>You've been invited to collaborate on a chat in ${config.name}.</p>`;
-    let body = `You've been invited to collaborate on a chat in ${config.name}.\n\nURL: ${config.url}`;
+    let body = `You've been invited to collaborate on a chat in ${config.name}.\n\nChat URL: ${chatLink}`;
     if (tempPassword) {
-      body += `\nEmail: ${user.email}\nTemporary password: ${tempPassword}`;
-      bodyHtml += `<p>URL: <a href="${config.url}">${config.url}</a></p><p>Email: ${user.email}</p><p>Temporary password: <strong>${tempPassword}</strong></p>`;
+      body += `\nEmail: ${user.email}\nTemporary password: ${tempPassword}\n\nPlease log in and change your password.`;
+      bodyHtml += `<p><strong>Chat:</strong> <a href="${chatLink}">${chatLink}</a></p><p>Email: ${user.email}</p><p>Temporary password: <strong>${tempPassword}</strong></p><p>Please log in and change your password.</p>`;
     } else {
-      body += `\nLog in at: ${config.url}`;
-      bodyHtml += `<p>URL: <a href="${config.url}">${config.url}</a></p>`;
+      body += `\n\nLog in with your existing password to access the chat.`;
+      bodyHtml += `<p><strong>Chat:</strong> <a href="${chatLink}">${chatLink}</a></p>`;
     }
     await sendEmail({ to: user.email, subject: `Chat Invite: ${chat.title || 'Collaboration'}`, body, bodyHtml });
     res.json({ ok: true });
@@ -2005,11 +2079,18 @@ app.get('/api/chats/:id/stream', requireAuth, (req, res) => {
   // Send connected event
   res.write(`event: connected\ndata: ${JSON.stringify({ chatId })}\n\n`);
 
-  // State sync: if agent is currently running for this chat, tell the new/reconnected client
+  // State sync: tell the new/reconnected client the current agent state
+  // If agent is currently running: send busy:true
+  // If agent is NOT running: send busy:false (catches reconnects after agent finished)
+  // If we send nothing when not busy, the client stays stuck in 'thinking' state forever
+  const proc = activeAgentProcesses[chatId];
+  const thinkingMsgId = proc ? proc.aiMsgId : null;
   if (chatGatewayBusy.has(chatId)) {
-    const proc = activeAgentProcesses[chatId];
-    const thinkingMsgId = proc ? proc.aiMsgId : null;
-    sendToClient(res, 'agent_status', { busy: true, thinkingMsgId });
+    sendToClient(res, 'agent_status', { busy: true, thinkingMsgId, chatId });
+  } else {
+    // Send explicit busy:false so the client knows the agent is done
+    // This is critical for reconnected clients that missed the original completion event
+    sendToClient(res, 'agent_status', { busy: false, thinkingMsgId: null, chatId });
   }
 
   req.on('close', () => {
