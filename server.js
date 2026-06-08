@@ -160,9 +160,56 @@ function drainQueue(chatId) {
     drainQueue(chatId);
   });
 }
+
 const db = require('./db');
 const { createGatewayClient } = require('./gateway-client');
 const sqlite3 = require('sqlite3');
+
+// ============================================================
+// Notification System
+// ============================================================
+
+// Ensure notifications table exists
+setTimeout(async () => {
+  try {
+    await db.run_(`CREATE TABLE IF NOT EXISTS notifications (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT,
+      link TEXT,
+      read INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL
+    )`);
+    console.log('[boot] Notifications table ready');
+  } catch (e) {
+    console.error('[boot] Failed to create notifications table:', e.message);
+  }
+}, 100);
+
+async function createNotification(userId, type, title, body, link) {
+  if (!userId || userId === 'legacy') return;
+  const id = require('crypto').randomUUID();
+  const now = Date.now();
+  await db.run_(
+    'INSERT INTO notifications (id, user_id, type, title, body, link, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [id, userId, type, title, body, link || null, now]
+  );
+  const clients = userSSEClients.get(String(userId));
+  if (clients) {
+    const eventData = JSON.stringify({ id, type, title, body, link, read: 0, created_at: now });
+    for (const res of clients) {
+      try { res.write(`event: notification\ndata: ${eventData}\n\n`); } catch {}
+    }
+  }
+}
+
+// Auto-cleanup: delete notifications older than 30 days
+setInterval(async () => {
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  await db.run_('DELETE FROM notifications WHERE created_at < ?', [cutoff]);
+}, 24 * 60 * 60 * 1000);
 // Open a fresh sessions.db connection per lookup to avoid lock conflicts with connect-sqlite3
 function getSession(sid) {
   return new Promise((resolve) => {
@@ -1564,6 +1611,150 @@ app.get('/api/share/:token', async (req, res) => {
   } else {
     res.status(400).json({ error: 'Unsupported' });
   }
+});
+
+// ============================================================
+// Notification Routes
+// ============================================================
+
+// GET /api/notifications — list current user's notifications
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  try {
+    const userId = req.session.userId || 'legacy';
+    const rows = await db.all_(
+      'SELECT * FROM notifications WHERE user_id = ? ORDER BY read ASC, created_at DESC LIMIT 50',
+      [String(userId)]
+    );
+    const total = rows.length > 0 ? (await db.get_('SELECT COUNT(*) as c FROM notifications WHERE user_id = ?', [String(userId)])).c : 0;
+    res.json({ notifications: rows, total });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/notifications/read/:id — mark single as read
+app.post('/api/notifications/read/:id', requireAuth, async (req, res) => {
+  try {
+    const userId = String(req.session.userId || 'legacy');
+    await db.run_('UPDATE notifications SET read = 1 WHERE id = ? AND user_id = ?', [req.params.id, userId]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/notifications/read-all — mark all as read
+app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
+  try {
+    const userId = String(req.session.userId || 'legacy');
+    await db.run_('UPDATE notifications SET read = 1 WHERE user_id = ? AND read = 0', [userId]);
+    // Push SSE event
+    const clients = userSSEClients.get(userId);
+    if (clients) {
+      for (const c of clients) { try { c.write(`event: notifications_read\ndata: {}\n\n`); } catch {} }
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/notifications/unread-count
+app.get('/api/notifications/unread-count', requireAuth, async (req, res) => {
+  try {
+    const userId = String(req.session.userId || 'legacy');
+    const row = await db.get_('SELECT COUNT(*) as count FROM notifications WHERE user_id = ? AND read = 0', [userId]);
+    res.json({ count: row ? row.count : 0 });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ============================================================
+// Resend Invite Routes
+// ============================================================
+
+// Admin resend invite
+app.post('/api/admin/users/:id/resend-invite', requireAuth, async (req, res) => {
+  try {
+    const role = getSessionRole(req);
+    if (role !== 'admin' && role !== 'accord') return res.status(403).json({ error: 'Forbidden' });
+    const user = await db.get_('SELECT * FROM users WHERE id = ?', [req.params.id]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const tempPassword = require('crypto').randomBytes(4).toString('hex');  // 8-char
+    const hash = require('bcrypt').hashSync(tempPassword, 10);
+    await db.run_('UPDATE users SET password_hash = ? WHERE id = ?', [hash, req.params.id]);
+    const { sendEmail } = require('./email');
+    const config = getInstanceConfig();
+    await sendEmail({
+      to: user.email,
+      subject: `Your invite to ${config.name}`,
+      body: `You have been invited to ${config.name}.\n\nURL: ${config.url}\nEmail: ${user.email}\nTemporary password: ${tempPassword}\n\nPlease log in and change your password.`,
+      bodyHtml: `<p>You have been invited to <strong>${config.name}</strong>.</p><p>URL: <a href="${config.url}">${config.url}</a></p><p>Email: ${user.email}</p><p>Temporary password: <strong>${tempPassword}</strong></p><p>Please log in and change your password.</p>`
+    });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Project resend invite
+app.post('/api/projects/:id/resend-invite/:userId', requireAuth, async (req, res) => {
+  try {
+    const role = getSessionRole(req);
+    if (role !== 'admin' && role !== 'accord') return res.status(403).json({ error: 'Forbidden' });
+    const user = await db.get_('SELECT * FROM users WHERE id = ?', [req.params.userId]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const project = await db.get_('SELECT * FROM projects WHERE id = ?', [req.params.id]);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+
+    let tempPassword = null;
+    if (user.password_hash && !user.password_hash.startsWith('$2')) {
+      tempPassword = require('crypto').randomBytes(4).toString('hex');
+      const hash = require('bcrypt').hashSync(tempPassword, 10);
+      await db.run_('UPDATE users SET password_hash = ? WHERE id = ?', [hash, req.params.userId]);
+    }
+
+    const { sendEmail } = require('./email');
+    const config = getInstanceConfig();
+    let bodyHtml = `<p>You've been invited to collaborate on the project <strong>${project.name}</strong> on ${config.name}.</p>`;
+    let body = `You've been invited to collaborate on the project "${project.name}" on ${config.name}.\n\nURL: ${config.url}`;
+    if (tempPassword) {
+      body += `\nEmail: ${user.email}\nTemporary password: ${tempPassword}`;
+      bodyHtml += `<p>URL: <a href="${config.url}">${config.url}</a></p><p>Email: ${user.email}</p><p>Temporary password: <strong>${tempPassword}</strong></p>`;
+    } else {
+      body += `\nLog in at: ${config.url}`;
+      bodyHtml += `<p>URL: <a href="${config.url}">${config.url}</a></p>`;
+    }
+    await sendEmail({ to: user.email, subject: `Project Invite: ${project.name}`, body, bodyHtml });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Chat resend invite
+app.post('/api/chats/:id/resend-invite/:userId', requireAuth, async (req, res) => {
+  try {
+    const role = getSessionRole(req);
+    const chat = await db.get_('SELECT * FROM chats WHERE id = ?', [req.params.id]);
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    const requesterId = req.session.userId || 'legacy';
+    const isOwner = !chat.owner_id || chat.owner_id === requesterId;
+    if (!isOwner && role !== 'admin' && role !== 'accord') return res.status(403).json({ error: 'Forbidden' });
+
+    const user = await db.get_('SELECT * FROM users WHERE id = ?', [req.params.userId]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    let tempPassword = null;
+    if (user.password_hash && !user.password_hash.startsWith('$2')) {
+      tempPassword = require('crypto').randomBytes(4).toString('hex');
+      const hash = require('bcrypt').hashSync(tempPassword, 10);
+      await db.run_('UPDATE users SET password_hash = ? WHERE id = ?', [hash, req.params.userId]);
+    }
+
+    const { sendEmail } = require('./email');
+    const config = getInstanceConfig();
+    let bodyHtml = `<p>You've been invited to collaborate on a chat in ${config.name}.</p>`;
+    let body = `You've been invited to collaborate on a chat in ${config.name}.\n\nURL: ${config.url}`;
+    if (tempPassword) {
+      body += `\nEmail: ${user.email}\nTemporary password: ${tempPassword}`;
+      bodyHtml += `<p>URL: <a href="${config.url}">${config.url}</a></p><p>Email: ${user.email}</p><p>Temporary password: <strong>${tempPassword}</strong></p>`;
+    } else {
+      body += `\nLog in at: ${config.url}`;
+      bodyHtml += `<p>URL: <a href="${config.url}">${config.url}</a></p>`;
+    }
+    await sendEmail({ to: user.email, subject: `Chat Invite: ${chat.title || 'Collaboration'}`, body, bodyHtml });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // --- Settings ---

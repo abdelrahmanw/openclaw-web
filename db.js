@@ -131,6 +131,20 @@ db.serialize(() => {
     details TEXT
   )`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp)`);
+
+  // Phase 6 - Notifications
+  db.run(`CREATE TABLE IF NOT EXISTS notifications (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT,
+    link TEXT,
+    read INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL
+  )`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read)`);
 });
 
 module.exports = db;

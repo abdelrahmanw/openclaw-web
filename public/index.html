@@ -63,6 +63,7 @@
       <button class="nav-tab active" onclick="showTab('chats',this)">Chats</button>
       <button class="nav-tab" onclick="showTab('projects',this)">Projects</button>
     </div>
+
     <div class="sidebar-content" id="sidebar-content"></div>
   </div>
 
@@ -101,6 +102,20 @@
             <hr class="tools-menu-divider"/>
             <button class="tools-menu-item" onclick="renameAllChats(); closeToolsMenu()" id="rename-all-btn">✨ Rename All</button>
             <button class="tools-menu-item" onclick="toggleTheme(); closeToolsMenu()" id="theme-toggle-btn">🌙 Theme</button>
+          </div>
+        </div>
+        <!-- Notification bell -->
+        <div class="notification-bell-wrap" id="notification-bell-wrap" style="position:relative;">
+          <button class="header-btn" onclick="toggleNotifications()" id="notif-bell-btn" title="Notifications" style="font-size:18px;padding:4px 8px;border:none;background:none;cursor:pointer;position:relative;">
+            🔔
+            <span id="notification-count" style="display:none;position:absolute;top:-2px;right:-2px;background:#ef4444;color:white;border-radius:10px;padding:0 5px;font-size:10px;font-weight:600;line-height:15px;min-width:15px;text-align:center;"></span>
+          </button>
+          <div id="notification-dropdown" style="display:none;position:absolute;right:0;top:100%;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.2);z-index:1001;max-height:400px;overflow-y:auto;width:320px;">
+            <div style="padding:10px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;font-size:13px;">
+              <strong>Notifications</strong>
+              <button onclick="markAllRead()" style="background:none;border:none;color:var(--accent);cursor:pointer;font-size:11px;">Mark all read</button>
+            </div>
+            <div id="notification-list"></div>
           </div>
         </div>
         <!-- User avatar -->

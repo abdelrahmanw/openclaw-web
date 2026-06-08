@@ -417,6 +417,24 @@ function startGlobalEventStream() {
   const es = new EventSource('/api/events');
   globalEventSource = es;
 
+  es.addEventListener('notification', e => {
+    try {
+      const notif = JSON.parse(e.data);
+      updateNotificationBadge();
+      // Show a brief visual indicator
+      const bell = document.getElementById('notification-count');
+      if (bell && bell.style.display !== 'none') {
+        bell.style.animation = 'none';
+        bell.offsetHeight;
+        bell.style.animation = 'pulse 0.3s ease';
+      }
+    } catch {}
+  });
+
+  es.addEventListener('notifications_read', () => {
+    updateNotificationBadge();
+  });
+
   es.addEventListener('chat_created', e => {
     try {
       const { chat } = JSON.parse(e.data);
@@ -448,6 +466,8 @@ async function showApp() {
   }
   // Route to deep-linked chat/project from URL
   routeFromURL();
+  // Initial notification badge load
+  updateNotificationBadge();
 }
 
 // === URL Routing ===
@@ -458,6 +478,109 @@ function slugify(name) {
     .replace(/^-+|-+$/g, '')
     .slice(0, 40) || 'project';
 }
+
+// ============================================================
+// Notifications
+// ============================================================
+let notificationDropdownOpen = false;
+
+function toggleNotifications() {
+  notificationDropdownOpen = !notificationDropdownOpen;
+  const dd = document.getElementById('notification-dropdown');
+  if (!dd) return;
+  dd.style.display = notificationDropdownOpen ? 'block' : 'none';
+  if (notificationDropdownOpen) loadNotifications();
+  else {
+    // Close dropdown when notification-list is loaded and user clicks away
+  }
+}
+
+// Close notification dropdown when clicking outside
+document.addEventListener('click', (e) => {
+  const notifArea = document.querySelector('.notification-bell-wrap');
+  if (notifArea && !notifArea.contains(e.target) && notificationDropdownOpen) {
+    notificationDropdownOpen = false;
+    const dd = document.getElementById('notification-dropdown');
+    if (dd) dd.style.display = 'none';
+  }
+});
+
+function loadNotifications() {
+  fetch('/api/notifications')
+    .then(r => r.json())
+    .then(data => {
+      renderNotifications(data.notifications || []);
+    })
+    .catch(() => {});
+}
+
+function renderNotifications(notifications) {
+  const list = document.getElementById('notification-list');
+  if (!list) return;
+  if (!notifications.length) {
+    list.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:13px;">No notifications</div>';
+    return;
+  }
+  const typeIcons = { project_invite: '📁', chat_invite: '💬', user_joined_chat: '👤', approval_result: '✅', project_removed: '🔴' };
+  list.innerHTML = notifications.map(n => {
+    const icon = typeIcons[n.type] || '🔔';
+    const ago = timeAgo(n.created_at);
+    const link = n.link ? n.link.replace(/"/g, '&quot;') : '';
+    return '<div onclick="clickNotification(\'' + n.id + '\',\'' + link + '\')" style="padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;' + (n.read ? 'opacity:0.7;' : 'background:var(--bg-hover);') + '">' +
+      '<div style="display:flex;align-items:flex-start;gap:6px;">' +
+        '<span style="font-size:14px;line-height:1.4;">' + icon + '</span>' +
+        '<div style="flex:1;min-width:0;">' +
+          '<div style="font-size:12px;font-weight:' + (n.read ? '400' : '600') + ';">' + esc(n.title) + '</div>' +
+          (n.body ? '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(n.body) + '</div>' : '') +
+          '<div style="font-size:10px;color:var(--text-muted);margin-top:3px;">' + ago + '</div>' +
+        '</div>' +
+      '</div></div>';
+  }).join('');
+}
+
+function clickNotification(id, link) {
+  fetch('/api/notifications/read/' + id, { method: 'POST' });
+  if (link) window.location.hash = link;
+  toggleNotifications();
+  updateNotificationBadge();
+}
+
+function markAllRead() {
+  fetch('/api/notifications/read-all', { method: 'POST' });
+  // Visually update
+  const items = document.querySelectorAll('#notification-list > div');
+  items.forEach(el => { el.style.opacity = '0.7'; el.style.background = ''; });
+  updateNotificationBadge();
+}
+
+function updateNotificationBadge() {
+  fetch('/api/notifications/unread-count')
+    .then(r => r.json())
+    .then(data => {
+      const badge = document.getElementById('notification-count');
+      if (!badge) return;
+      if (data.count > 0) {
+        badge.style.display = 'inline';
+        badge.textContent = data.count > 99 ? '99+' : data.count;
+      } else {
+        badge.style.display = 'none';
+      }
+    })
+    .catch(() => {});
+}
+
+function timeAgo(ts) {
+  const diff = Date.now() - ts;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return mins + 'm ago';
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs + 'h ago';
+  const days = Math.floor(hrs / 24);
+  return days + 'd ago';
+}
+
+// ============================================================
 
 function chatURL(chat) {
   if (chat.project_id) {
@@ -3846,6 +3969,7 @@ async function renderAdminUsers(body) {
                 ? `<button class="admin-btn sm danger" onclick="toggleUserActive('${u.id}',0)">Deactivate</button>`
                 : `<button class="admin-btn sm" onclick="toggleUserActive('${u.id}',1)">Reactivate</button>`
               }
+              ${u.created_by ? `<button class="admin-btn sm" onclick="resendInviteAdmin('${u.id}')">📧 Resend</button>` : ''}
               ${window.currentUser?.role === 'admin' ? `<button class="admin-btn sm danger" onclick="deleteUser('${u.id}','${esc(u.email)}')">Delete</button>` : ''}
             </td>
           </tr>
@@ -3949,6 +4073,19 @@ async function toggleUserActive(userId, active) {
     });
     loadAdminTab('users');
   } catch (e) { alert(e.message); }
+}
+
+async function resendInviteAdmin(userId) {
+  if (!confirm('Resend invite email to this user?')) return;
+  try {
+    const res = await fetch('/api/admin/users/' + userId + '/resend-invite', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      showToast('Invite resent!');
+    } else {
+      showToast('Error: ' + (data.error || 'unknown'), 4000);
+    }
+  } catch (e) { showToast('Error: ' + e.message, 4000); }
 }
 
 async function deleteUser(userId, email) {
