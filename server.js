@@ -676,14 +676,17 @@ app.get('/api/update/check', requireAuth, requireRole('admin', 'accord'), async 
       }).on('error', reject);
     });
     const remote = JSON.parse(remoteRaw);
+    // Always read version.json fresh so current is never stale after a deploy
+    let liveLocal = localVersion;
+    try { liveLocal = JSON.parse(fs.readFileSync(LOCAL_VERSION_PATH, 'utf8')); localVersion = liveLocal; } catch(_) {}
     res.json({
-      current: localVersion.version,
-      currentLabel: localVersion.label,
+      current: liveLocal.version,
+      currentLabel: liveLocal.label,
       latest: remote.version,
       latestLabel: remote.label,
       latestCommit: remote.commit,
       pushedAt: remote.pushed_at,
-      hasUpdate: remote.version !== localVersion.version
+      hasUpdate: remote.version !== liveLocal.version
     });
   } catch (e) {
     res.status(500).json({ error: 'Failed to check for updates: ' + e.message });
@@ -1263,7 +1266,7 @@ app.get('/api/admin/version', requireAuth, requireRole('admin'), async (req, res
 app.post('/api/admin/deploy', requireAuth, requireRole('admin'), async (req, res) => {
   const pm2AppName = process.env.PM2_APP_NAME || 'antar-web';
   // Run git pull first, send response, THEN restart (so response isn't killed mid-flight)
-  exec(`cd ${__dirname} && git pull`, { timeout: 60000 }, (err, stdout, stderr) => {
+  exec(`cd ${__dirname} && git fetch origin main && git reset --hard origin/main`, { timeout: 60000 }, (err, stdout, stderr) => {
     const pullOutput = (stdout || '') + (stderr || '');
     if (err) {
       return res.json({ ok: false, stdout, stderr, error: err?.message });

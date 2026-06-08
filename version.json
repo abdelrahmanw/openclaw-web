@@ -1,0 +1,6 @@
+{
+  "version": "v4.2_2026-06-08_0024_1",
+  "pushed_at": "2026-06-08T00:24:00.000Z",
+  "commit": "4761285",
+  "label": "fix: version auto-increment on publish + admin panel version display"
+}

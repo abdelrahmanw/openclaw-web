@@ -4237,13 +4237,13 @@ async function loadVersion() {
       const badgeText = data.versionLabel || data.hash || 'unknown';
       if (badge) badge.textContent = badgeText;
       section.innerHTML = `
-        <div style="background:var(--bg-secondary,#1e1e1e);border:1px solid var(--border,#333);border-radius:8px;padding:12px 16px;font-size:13px">
-          <div style="font-weight:600;margin-bottom:6px;color:var(--text-primary)">accord-agentweb version</div>
-          <div style="color:var(--text-muted);line-height:1.8">
-            <span style="font-family:monospace;background:var(--bg-tertiary,#2a2a2a);padding:2px 6px;border-radius:4px">${esc(data.hash)}</span>
+        <div style="font-size:13px;color:var(--text-muted);line-height:1.8">
+          ${data.versionLabel ? `<div><strong style="color:var(--text-primary)">${esc(data.versionLabel)}</strong></div>` : ''}
+          <div>
+            <span style="font-family:monospace">${esc(data.hash)}</span>
             &nbsp;${esc(data.subject)}
           </div>
-          ${dateStr ? `<div style="color:var(--text-muted);font-size:12px;margin-top:4px">${dateStr}</div>` : ''}
+          ${dateStr ? `<div style="font-size:12px">${dateStr}</div>` : ''}
         </div>
       `;
     } else {
