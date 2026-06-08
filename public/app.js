@@ -999,7 +999,8 @@ function renderMessage(msg, staleThinkingIds) {
     }
   } else {
     const rendered = isUser ? esc(msg.content).replace(/\n/g, '<br>') : renderMarkdown(msg.content);
-    content = `<div class="message-bubble">${rendered}</div>`;
+    const dirAttr = containsArabic(msg.content) ? ' dir="rtl"' : '';
+    content = `<div class="message-bubble"${dirAttr}>${rendered}</div>`;
   }
 
   // Attachments
@@ -1051,6 +1052,10 @@ function renderMessage(msg, staleThinkingIds) {
 function renderMarkdown(text) {
   if (typeof marked === 'undefined') return esc(text).replace(/\n/g, '<br>');
   try { return marked.parse(text); } catch { return esc(text).replace(/\n/g, '<br>'); }
+}
+
+function containsArabic(text) {
+  return /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/.test(text || '');
 }
 
 function extractArtifacts(content) {
