@@ -14,7 +14,8 @@ echo ""
 cd "$REPO_DIR"
 
 echo "[1/3] Pulling latest..."
-git pull origin main
+git fetch origin main
+git reset --hard origin/main
 echo "      Done."
 
 echo "[2/3] Installing dependencies..."
