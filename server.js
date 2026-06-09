@@ -906,7 +906,7 @@ app.post('/api/chats/:id/send-voice-reply', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-const OPENCLAW_BIN = '/usr/bin/openclaw';
+const OPENCLAW_BIN = '/data/.npm-global/bin/openclaw';
 
 async function runAgent(chat, userMessage, attachments, aiMsgId) {
   try {
