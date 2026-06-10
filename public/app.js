@@ -1459,6 +1459,22 @@ function scrollToBottom() {
   area.scrollTop = area.scrollHeight;
 }
 
+// Replace an in-flight assistant bubble's content with streamed partial text.
+// Leaves the rest of the message DOM (avatar, timestamp) untouched.
+function applyMessageDelta(data) {
+  if (!data || !data.id || !data.content) return;
+  const msgEl = document.querySelector(`.message[data-id="${data.id}"]`);
+  if (!msgEl) return; // not rendered yet; the next 'message' event will catch up
+  const bubble = msgEl.querySelector('.message-bubble');
+  if (!bubble) return;
+  const area = document.getElementById('messages-area');
+  const nearBottom = area && (area.scrollHeight - area.scrollTop - area.clientHeight) < 160;
+  bubble.classList.remove('thinking', 'thinking-stale');
+  if (containsArabic(data.content)) bubble.setAttribute('dir', 'rtl');
+  bubble.innerHTML = renderMarkdown(data.content);
+  if (nearBottom) scrollToBottom();
+}
+
 // === File handling ===
 function setupDragDrop() {
   const area = document.getElementById('input-area');
@@ -4670,6 +4686,13 @@ function connectChatSSE(chatId) {
     if (state.currentChat?.id === chatId) {
       await loadMessages(); scrollToBottom();
     }
+  });
+
+  // Streaming partial reply: update the assistant bubble in place (Telegram-style).
+  // The payload content is the full cleaned text so far, not an increment.
+  es.addEventListener('message_delta', (e) => {
+    if (state.currentChat?.id !== chatId) return;
+    try { applyMessageDelta(JSON.parse(e.data)); } catch {}
   });
 
   es.addEventListener('agent_status', async (e) => {

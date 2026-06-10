@@ -792,6 +792,12 @@ app.post('/api/chats/:id/send', upload.array('files'), async (req, res) => {
     const { message, voiceAudioPath, voiceAudioFilename, voiceAudioSize } = req.body;
     const files = req.files || [];
     const now = Date.now();
+
+    // /restart — restart the OpenClaw gateway (admin/accord only). Handled here,
+    // NOT sent to the agent, so it works even when the gateway is wedged.
+    if ((message || '').trim() === '/restart') {
+      return handleRestartCommand(req, res, chat, now);
+    }
     const attachments = files.map(f => ({ name: f.originalname, path: f.path, size: f.size, mimetype: f.mimetype }));
     // Voice message: audio was already saved by /api/transcribe; just reference it
     if (voiceAudioPath && fs.existsSync(voiceAudioPath)) {
@@ -908,6 +914,132 @@ app.post('/api/chats/:id/send-voice-reply', requireAuth, async (req, res) => {
 
 const OPENCLAW_BIN = '/data/.npm-global/bin/openclaw';
 
+// Streaming agent run via the gateway WebSocket (chat.send + chat delta events).
+// The gateway streams cumulative, cleaned assistant text (tool/thinking chatter is
+// never included), which we relay to the browser as `message_delta` SSE events —
+// a single growing bubble, Telegram-style. chat.send also persists the turn in the
+// OpenClaw session transcript natively, so the old chat.inject step is unnecessary.
+// Rejects with err.transport=true if it failed BEFORE the run started (safe to
+// retry via the CLI path); any later failure is surfaced, never re-run.
+function runAgentViaGateway(chat, fullMessage, aiMsgId, sessionKey) {
+  return new Promise((resolve, reject) => {
+    const runId = uuidv4();
+    const gw = createGatewayClient();
+    let sendAccepted = false;
+    let settled = false;
+
+    const finish = (fn, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(killTimer);
+      if (activeAgentProcesses[chat.id] && activeAgentProcesses[chat.id].runId === runId) {
+        delete activeAgentProcesses[chat.id];
+      }
+      try { gw.close(); } catch {}
+      fn(val);
+    };
+
+    const fail = (err, transport) => {
+      if (transport) err.transport = true;
+      finish(reject, err);
+    };
+
+    const killTimer = setTimeout(() => {
+      gw.request('chat.abort', { sessionKey, runId }).catch(() => {});
+      fail(new Error('Agent timed out after 300s'), false);
+    }, 300000);
+
+    const extractText = (payload) =>
+      (payload.message?.content || [])
+        .filter(c => c && c.type === 'text' && typeof c.text === 'string')
+        .map(c => c.text)
+        .join('\n');
+
+    gw.on('chat', (payload) => {
+      if (!payload || payload.runId !== runId) return;
+      const text = extractText(payload);
+      if (payload.state === 'delta') {
+        if (!text) return;
+        // SSE-only on purpose: the legacy 1.5s poll treats any non-placeholder DB
+        // content as "agent done", so partial text must never be written to the DB.
+        broadcastToChat(chat.id, 'message_delta', { id: aiMsgId, chatId: chat.id, content: text });
+      } else if (payload.state === 'final') {
+        finish(resolve, text || 'Done.');
+      } else if (payload.state === 'aborted') {
+        finish(resolve, text ? `${text}\n\n_[Stopped]_` : '[Stopped]');
+      } else if (payload.state === 'error') {
+        fail(new Error(payload.errorMessage || 'Agent run failed'), false);
+      }
+    });
+
+    gw.ready
+      .then(() => gw.request('chat.send', {
+        sessionKey,
+        message: fullMessage,
+        idempotencyKey: runId,
+        timeoutMs: 290000,
+      }))
+      .then(() => {
+        sendAccepted = true;
+        // Compatible with the /api/chats/:id/abort handler (proc.child.kill)
+        activeAgentProcesses[chat.id] = {
+          aiMsgId,
+          runId,
+          child: { kill: () => { gw.request('chat.abort', { sessionKey, runId }).catch(() => {}); } },
+        };
+      })
+      .catch((e) => fail(e instanceof Error ? e : new Error(String(e)), !sendAccepted));
+  });
+}
+
+// Legacy one-shot CLI run — kept as a fallback when the gateway WS path is unavailable.
+function runAgentViaCli(chat, fullMessage, aiMsgId) {
+  const sessionKey = chat.telegram_session_key || `web-${chat.id}`;
+  return new Promise((resolve, reject) => {
+    const args = [
+      'agent',
+      '--session-id', sessionKey,
+      '--message', fullMessage,
+      '--json'
+    ];
+
+    // Load env from ~/.openclaw/.env
+    const envLines = (() => {
+      try { return fs.readFileSync(path.join(process.env.HOME || '/home/clawdbot', '.openclaw', '.env'), 'utf8').split('\n'); }
+      catch { return []; }
+    })();
+    const extraEnv = {};
+    for (const line of envLines) {
+      const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+      if (m) extraEnv[m[1]] = m[2].replace(/^["']|["']$/g, '');
+    }
+
+    const child = execFile(OPENCLAW_BIN, args, {
+      timeout: 300000, // 5 min
+      maxBuffer: 10 * 1024 * 1024,
+      env: { ...process.env, ...extraEnv }
+    }, (err, stdout, stderr) => {
+      delete activeAgentProcesses[chat.id]; // clean up when done
+      if (err && !stdout) return reject(new Error(err.message + (stderr ? '\n' + stderr.slice(0, 500) : '')));
+      // Parse JSON output
+      try {
+        // stdout may have config warnings before JSON
+        const jsonStart = stdout.indexOf('{');
+        if (jsonStart < 0) return reject(new Error('No JSON in agent output: ' + stdout.slice(0, 300)));
+        const result = JSON.parse(stdout.slice(jsonStart));
+        if (result.status !== 'ok') return reject(new Error('Agent status: ' + result.status));
+        const texts = (result.result?.payloads || []).map(p => p.text).filter(Boolean);
+        resolve(texts.join('\n\n') || 'Done.');
+      } catch (parseErr) {
+        // Fallback: return raw stdout stripped of config warnings
+        const clean = stdout.replace(/^Config warnings:[\s\S]*?\n\n/m, '').trim();
+        resolve(clean || 'Done.');
+      }
+    });
+    activeAgentProcesses[chat.id] = { child, aiMsgId };
+  });
+}
+
 async function runAgent(chat, userMessage, attachments, aiMsgId) {
   try {
     let fullMessage = userMessage || '';
@@ -949,52 +1081,18 @@ async function runAgent(chat, userMessage, attachments, aiMsgId) {
     }
 
     // Derive session key: use chat's telegram_session_key if set, otherwise use chat id
-    const sessionKey = chat.telegram_session_key || `web-${chat.id}`;
+    const sessionKey = chat.telegram_session_key || `explicit:web-${chat.id}`;
 
-    // Run the real OpenClaw agent via CLI — same session store as Telegram
-    const reply = await new Promise((resolve, reject) => {
-      const args = [
-        'agent',
-        '--session-id', sessionKey,
-        '--message', fullMessage,
-        '--json'
-      ];
-
-      // Load env from ~/.openclaw/.env
-      const envLines = (() => {
-        try { return fs.readFileSync(path.join(process.env.HOME || '/home/clawdbot', '.openclaw', '.env'), 'utf8').split('\n'); }
-        catch { return []; }
-      })();
-      const extraEnv = {};
-      for (const line of envLines) {
-        const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
-        if (m) extraEnv[m[1]] = m[2].replace(/^["']|["']$/g, '');
-      }
-
-      const child = execFile(OPENCLAW_BIN, args, {
-        timeout: 300000, // 5 min
-        maxBuffer: 10 * 1024 * 1024,
-        env: { ...process.env, ...extraEnv }
-      }, (err, stdout, stderr) => {
-        delete activeAgentProcesses[chat.id]; // clean up when done
-        if (err && !stdout) return reject(new Error(err.message + (stderr ? '\n' + stderr.slice(0, 500) : '')));
-        // Parse JSON output
-        try {
-          // stdout may have config warnings before JSON
-          const jsonStart = stdout.indexOf('{');
-          if (jsonStart < 0) return reject(new Error('No JSON in agent output: ' + stdout.slice(0, 300)));
-          const result = JSON.parse(stdout.slice(jsonStart));
-          if (result.status !== 'ok') return reject(new Error('Agent status: ' + result.status));
-          const texts = (result.result?.payloads || []).map(p => p.text).filter(Boolean);
-          resolve(texts.join('\n\n') || 'Done.');
-        } catch (parseErr) {
-          // Fallback: return raw stdout stripped of config warnings
-          const clean = stdout.replace(/^Config warnings:[\s\S]*?\n\n/m, '').trim();
-          resolve(clean || 'Done.');
-        }
-      });
-      activeAgentProcesses[chat.id] = { child, aiMsgId };
-    });
+    // Run the agent: streaming gateway path first, legacy CLI only if the gateway
+    // transport was unavailable before the run started (never re-runs a started turn).
+    let reply;
+    try {
+      reply = await runAgentViaGateway(chat, fullMessage, aiMsgId, sessionKey);
+    } catch (gwErr) {
+      if (!gwErr.transport) throw gwErr;
+      console.error('gateway streaming path unavailable, falling back to CLI:', gwErr.message);
+      reply = await runAgentViaCli(chat, fullMessage, aiMsgId);
+    }
 
     await db.run_('UPDATE messages SET content = ? WHERE id = ?', [reply, aiMsgId]);
     await db.run_('UPDATE chats SET updated_at = ? WHERE id = ?', [Date.now(), chat.id]);
@@ -1005,18 +1103,9 @@ async function runAgent(chat, userMessage, attachments, aiMsgId) {
     // Clear agent-thinking indicator
     broadcastToChat(chat.id, 'typing', { users: [], names: [] });
 
-    // Inject completion into the OpenClaw session so webchat surfaces it even on background turns.
-    // Fire-and-forget — never block the main response path on this.
-    (() => {
-      const sessionKey = chat.telegram_session_key || `web-${chat.id}`;
-      // Only inject for web sessions (Telegram has its own delivery path)
-      if (!sessionKey.startsWith('web-')) return;
-      const gw = createGatewayClient();
-      gw.ready
-        .then(() => gw.request('chat.inject', { sessionKey, message: reply }))
-        .catch(() => {}) // best-effort; never throw
-        .finally(() => { try { gw.close(); } catch {} });
-    })();
+    // NOTE: the old chat.inject step was removed (2026-06-10). chat.send persists the
+    // assistant turn in the OpenClaw session transcript natively, so injecting again
+    // duplicated transcript messages and failed with "session not found" on stale keys.
 
     // Auto-title: generate after first AI reply if still 'New Chat'
     try {
@@ -1339,6 +1428,56 @@ app.get('/api/admin/pm2-status', requireAuth, requireRole('admin', 'accord'), as
       res.json({ ok: false, raw: stdout, error: err?.message });
     }
   });
+});
+
+// --- /restart chat command + gateway restart (admin + accord) ---
+// Restarts the OpenClaw GATEWAY (openclaw.service) — i.e. "restart the bot".
+// Requires the sudoers entry: clawdbot ALL=(root) NOPASSWD: /usr/bin/systemctl restart openclaw.service
+function restartGateway() {
+  return new Promise((resolve) => {
+    exec('sudo -n /usr/bin/systemctl restart openclaw.service', { timeout: 60000 }, (err, stdout, stderr) => {
+      resolve({ ok: !err, error: err ? (stderr || err.message) : null });
+    });
+  });
+}
+
+async function handleRestartCommand(req, res, chat, now) {
+  const role = getSessionRole(req);
+  const allowed = role === 'admin' || role === 'accord';
+
+  // Record the command and a status bubble in the chat like a normal exchange
+  const userMsgId = uuidv4();
+  await db.run_(
+    'INSERT INTO messages (id, chat_id, role, content, attachments, created_at, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [userMsgId, chat.id, 'user', '/restart', '[]', now, req.session.userId || null]
+  );
+  const aiMsgId = uuidv4();
+  const initialText = allowed ? '♻️ Restarting Antar (gateway)…' : '⛔ /restart is only available to admins.';
+  await db.run_(
+    'INSERT INTO messages (id, chat_id, role, content, attachments, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+    [aiMsgId, chat.id, 'assistant', initialText, '[]', now + 1]
+  );
+  await db.run_('UPDATE chats SET updated_at = ? WHERE id = ?', [now, chat.id]);
+  for (const id of [userMsgId, aiMsgId]) {
+    const m = await db.get_('SELECT * FROM messages WHERE id = ?', [id]);
+    broadcastToChat(chat.id, 'message', { ...m, attachments: [] });
+  }
+  res.json({ userMsgId, aiMsgId, status: allowed ? 'restarting' : 'denied' });
+  if (!allowed) return;
+
+  const result = await restartGateway();
+  const finalText = result.ok
+    ? '✅ Antar gateway restarted. Give it ~20 seconds to reconnect, then carry on.'
+    : `❌ Gateway restart failed: ${String(result.error).slice(0, 300)}`;
+  await db.run_('UPDATE messages SET content = ? WHERE id = ?', [finalText, aiMsgId]);
+  const aiMsg = await db.get_('SELECT * FROM messages WHERE id = ?', [aiMsgId]);
+  broadcastToChat(chat.id, 'message', { ...aiMsg, attachments: [] });
+}
+
+// Gateway restart endpoint (admin + accord) — same action as the /restart chat command
+app.post('/api/admin/gateway-restart', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
+  const result = await restartGateway();
+  res.json(result);
 });
 
 // PM2 restart (admin + accord)
@@ -2499,8 +2638,33 @@ app.post('/internal/send-email', async (req, res) => {
   }
 });
 
+// --- Google OAuth callback handler ---
+app.get('/oauth2callback', async (req, res) => {
+  const code = req.query.code;
+  const state = req.query.state;
+  if (!code) {
+    return res.status(400).send('<html><body><h1>Missing authorization code</h1></body></html>');
+  }
+  try {
+    const { google } = require('googleapis');
+    const creds = JSON.parse(fs.readFileSync('/home/clawdbot/.openclaw/workspace/google-creds.json'));
+    const installed = creds.installed || creds.web || creds;
+    const oauth2 = new google.auth.OAuth2(
+      installed.client_id, installed.client_secret,
+      'https://your-agent-url/oauth2callback'
+    );
+    const { tokens } = await oauth2.getToken(code);
+    fs.writeFileSync('/home/clawdbot/.openclaw/workspace/google-token.json', JSON.stringify(tokens));
+    console.log('[oauth] Token saved to google-token.json');
+    res.send('<html><body><h1>Authorization successful!</h1><p>Token saved. You can close this tab.</p></body></html>');
+  } catch (e) {
+    console.error('[oauth] Token exchange error:', e.message);
+    res.status(500).send(`<html><body><h1>Error</h1><p>${e.message}</p></body></html>`);
+  }
+});
+
 // --- SPA catch-all: serve index.html for any non-API, non-share, non-static path ---
-app.get(/^(?!\/api\/|\/share\/).*/, (req, res) => {
+app.get(/^(?!\/api\/|\/share\/|\/oauth2callback).*/, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 

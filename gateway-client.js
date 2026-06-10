@@ -102,8 +102,8 @@ function createGatewayClient() {
       const signature  = signPayload(device.privateKeyPem, payloadStr);
       try {
         await _request('connect', {
-          minProtocol: 3, maxProtocol: 3,
-          client: { id: 'cli', version: '2026.4.23', platform: 'linux', mode: 'cli' },
+          minProtocol: 4, maxProtocol: 4,
+          client: { id: 'cli', version: '2026.5.28', platform: 'linux', mode: 'cli' },
           auth: { token: TOKEN }, scopes: SCOPES, role: 'operator',
           device: {
             id: device.deviceId,
