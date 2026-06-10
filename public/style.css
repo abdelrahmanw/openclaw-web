@@ -1086,6 +1086,8 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
   flex: 1;
 }
 .project-child-chat.active .project-child-chat-title { color: var(--text); }
+.project-child-chat-actions { display: none; gap: 1px; margin-left: auto; }
+.project-child-chat:hover .project-child-chat-actions { display: flex; }
 .project-no-chats { font-size: 11px; color: var(--text-muted); padding: 4px 8px; }
 
 /* === Search: content results & spinner === */

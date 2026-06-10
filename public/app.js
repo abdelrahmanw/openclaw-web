@@ -763,6 +763,11 @@ function renderProjects(el) {
               return `<div class="project-child-chat ${chatActive}" onclick="openChat('${c.id}')">
                 <span style="font-size:12px;opacity:0.6">💬</span>
                 <span class="project-child-chat-title">${esc(c.title)}</span>
+                <div class="project-child-chat-actions">
+                  <button class="action-btn" onclick="event.stopPropagation();renameChat('${c.id}')" title="Rename">✏️</button>
+                  <button class="action-btn" onclick="event.stopPropagation();moveChatToProject('${c.id}')" title="Move to project">📁</button>
+                  <button class="action-btn" onclick="event.stopPropagation();deleteChat('${c.id}')" title="Delete">🗑</button>
+                </div>
               </div>`;
             }).join('')
           : `<div class="project-no-chats">No chats yet</div>`
@@ -3936,7 +3941,8 @@ function showAdminPanel() {
   if (existing) existing.remove();
 
   const user = window.currentUser;
-  const isAdmin = user && user.role === 'admin';
+  const isAdmin = user && (user.role === 'admin' || user.role === 'accord');
+  const canSeeTech = user && (user.role === 'admin' || user.role === 'accord');
 
   const overlay = document.createElement('div');
   overlay.id = 'admin-panel-overlay';
@@ -3951,7 +3957,7 @@ function showAdminPanel() {
       <button class="admin-tab" data-tab="perms" onclick="switchAdminTab('perms',this)">Guest Permissions</button>
       <button class="admin-tab" data-tab="access" onclick="switchAdminTab('access',this)">Project Access</button>
       <button class="admin-tab" data-tab="audit" onclick="switchAdminTab('audit',this)">Audit Log</button>
-      ${isAdmin ? `<button class="admin-tab" data-tab="tech" onclick="switchAdminTab('tech',this)">Technical Settings</button>` : ''}
+      ${canSeeTech ? `<button class="admin-tab" data-tab="tech" onclick="switchAdminTab('tech',this)">Technical Settings</button>` : ''}    
     </div>
     <div class="admin-body" id="admin-body">
       <div style="color:var(--text-muted);font-size:13px;padding:20px">Loading...</div>

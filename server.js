@@ -1329,8 +1329,8 @@ app.get('/api/admin/audit-log', requireAuth, requireRole('admin', 'accord'), asy
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// PM2 status (admin only)
-app.get('/api/admin/pm2-status', requireAuth, requireRole('admin'), async (req, res) => {
+// PM2 status (admin + accord)
+app.get('/api/admin/pm2-status', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
   exec('pm2 list --json', (err, stdout) => {
     try {
       const data = JSON.parse(stdout || '[]');
@@ -1341,8 +1341,8 @@ app.get('/api/admin/pm2-status', requireAuth, requireRole('admin'), async (req, 
   });
 });
 
-// PM2 restart (admin only)
-app.post('/api/admin/pm2-restart', requireAuth, requireRole('admin'), async (req, res) => {
+// PM2 restart (admin + accord)
+app.post('/api/admin/pm2-restart', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
   const pm2Name = process.env.PM2_APP_NAME || 'antar-web';
   exec(`pm2 restart ${pm2Name}`, (err, stdout, stderr) => {
     res.json({ ok: !err, stdout, stderr, error: err?.message });
@@ -1351,7 +1351,7 @@ app.post('/api/admin/pm2-restart', requireAuth, requireRole('admin'), async (req
 
 // Server log (admin only)
 // Version info
-app.get('/api/admin/version', requireAuth, requireRole('admin'), async (req, res) => {
+app.get('/api/admin/version', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
   exec(`cd ${__dirname} && git log -1 --format="%h|%s|%ci" 2>&1`, (err, stdout) => {
     if (err || !stdout.trim()) return res.json({ ok: false, version: 'unknown' });
     const [hash, subject, date] = stdout.trim().split('|');
@@ -1365,8 +1365,8 @@ app.get('/api/admin/version', requireAuth, requireRole('admin'), async (req, res
   });
 });
 
-// Deploy (admin only)
-app.post('/api/admin/deploy', requireAuth, requireRole('admin'), async (req, res) => {
+// Deploy (admin + accord)
+app.post('/api/admin/deploy', requireAuth, requireRole('admin', 'accord'), async (req, res) => {
   const pm2AppName = process.env.PM2_APP_NAME || 'antar-web';
   // Run git pull first, send response, THEN restart (so response isn't killed mid-flight)
   exec(`cd ${__dirname} && git fetch origin main && git reset --hard origin/main`, { timeout: 60000 }, (err, stdout, stderr) => {
