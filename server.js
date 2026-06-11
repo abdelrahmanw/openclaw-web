@@ -1785,6 +1785,15 @@ app.get('/api/download', (req, res) => {
   res.download(filePath);
 });
 
+// --- Download generated files (produced by the agent) ---
+app.get('/api/download/generated/:filename', (req, res) => {
+  const safeName = path.basename(req.params.filename).replace(/[^a-zA-Z0-9._-]/g, '');
+  if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
+  const filePath = path.join(__dirname, 'generated', safeName);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
+  res.download(filePath);
+});
+
 // --- Shares ---
 app.post('/api/shares', async (req, res) => {
   const { resource_type, resource_id, password } = req.body;

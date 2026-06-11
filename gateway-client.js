@@ -30,7 +30,7 @@ function normalizeDeviceMeta(v) {
 }
 
 function buildAuthPayload(params) {
-  return ['v3', params.deviceId, 'cli', 'cli', 'operator',
+  return ['v4', params.deviceId, 'cli', 'cli', 'operator',
     SCOPES.join(','), String(params.signedAtMs),
     params.token ?? '', params.nonce,
     normalizeDeviceMeta('linux'), ''
