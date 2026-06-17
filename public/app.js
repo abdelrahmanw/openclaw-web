@@ -1148,7 +1148,7 @@ function renderMessage(msg, staleThinkingIds) {
     }
   } else {
     const rendered = isUser ? esc(msg.content).replace(/\n/g, '<br>') : renderMarkdown(msg.content);
-    const dirAttr = containsArabic(msg.content) ? ' dir="rtl"' : '';
+    const dirAttr = getTextDirection(msg.content) === 'rtl' ? ' dir="rtl"' : '';
     content = `<div class="message-bubble"${dirAttr}>${rendered}</div>`;
   }
 
@@ -1203,8 +1203,11 @@ function renderMarkdown(text) {
   try { return marked.parse(text); } catch { return esc(text).replace(/\n/g, '<br>'); }
 }
 
-function containsArabic(text) {
-  return /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/.test(text || '');
+function getTextDirection(text) {
+  const str = text || '';
+  const arabicChars = (str.match(/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/g) || []).length;
+  const latinChars = (str.match(/[a-zA-Z\u00C0-\u024F]/g) || []).length;
+  return arabicChars > latinChars ? 'rtl' : 'ltr';
 }
 
 function extractArtifacts(content) {
@@ -1470,7 +1473,7 @@ function applyMessageDelta(data) {
   const area = document.getElementById('messages-area');
   const nearBottom = area && (area.scrollHeight - area.scrollTop - area.clientHeight) < 160;
   bubble.classList.remove('thinking', 'thinking-stale');
-  if (containsArabic(data.content)) bubble.setAttribute('dir', 'rtl');
+  if (getTextDirection(data.content) === 'rtl') bubble.setAttribute('dir', 'rtl');
   bubble.innerHTML = renderMarkdown(data.content);
   if (nearBottom) scrollToBottom();
 }
@@ -2517,6 +2520,7 @@ async function renameAllChats() {
 let workflowsLoaded = false;
 let allWorkflows = [];
 let activeWorkflowPath = null;
+let activeWorkflowContent = null;
 
 // --- Workflow Folders (localStorage-based) ---
 const WORKFLOWS_STORAGE_KEY = 'openclaw-workflows-folders-v1';
@@ -2879,11 +2883,11 @@ async function openWorkflow(workflowPath, workflowName, el) {
 
   try {
     const res = await api(`/api/workflows/content?workflowPath=${encodeURIComponent(workflowPath)}`);
-    const content = res.content;
+    activeWorkflowContent = res.content;
     body.innerHTML = `
-      ${renderMarkdown(content)}
+      ${renderMarkdown(activeWorkflowContent)}
       <div class="skills-viewer-footer">
-        <button class="skills-use-btn" onclick="handleUseWorkflow(${JSON.stringify(workflowName)}, ${JSON.stringify(content)})">▶ Use Workflow</button>
+        <button class="skills-use-btn" onclick="handleUseWorkflow()">▶ Use Workflow</button>
       </div>`;
     body.querySelectorAll('pre code').forEach(block => hljs.highlightElement(block));
   } catch (e) {
@@ -2892,6 +2896,8 @@ async function openWorkflow(workflowPath, workflowName, el) {
 }
 
 async function handleUseWorkflow(workflowName, workflowContent) {
+  workflowName = workflowName ?? activeWorkflowPath?.split('/').pop() ?? '';
+  workflowContent = workflowContent ?? activeWorkflowContent ?? '';
   if (window.currentUser?.role === 'guest') {
     const chatId = state.currentChat?.id;
     if (!chatId) { showToast('Open a chat first'); return; }
@@ -2918,6 +2924,7 @@ function closeWorkflowViewer() {
   document.getElementById('workflows-list').style.display = '';
   document.getElementById('workflows-search').parentElement.style.display = '';
   activeWorkflowPath = null;
+  activeWorkflowContent = null;
   document.querySelectorAll('[data-workflow-idx]').forEach(i => i.classList.remove('active'));
 }
 
@@ -2935,6 +2942,7 @@ function filterWorkflows(query) {
 let skillsLoaded = false;
 let allSkills = [];
 let activeSkillPath = null;
+let activeSkillContent = null;
 
 // --- Skill Folders (localStorage-based) ---
 // Structure: { folders: [{id, name}], assignments: {skillPath: folderId}, collapsed: {folderId: bool} }
@@ -3369,11 +3377,11 @@ async function openSkill(skillPath, skillName, el) {
 
   try {
     const res = await api(`/api/skills/content?skillPath=${encodeURIComponent(skillPath)}`);
-    const content = res.content;
+    activeSkillContent = res.content;
     body.innerHTML = `
-      ${renderMarkdown(content)}
+      ${renderMarkdown(activeSkillContent)}
       <div class="skills-viewer-footer">
-        <button class="skills-use-btn" onclick="handleUseSkill(${JSON.stringify(skillName)}, ${JSON.stringify(content)})">▶ Use Skill</button>
+        <button class="skills-use-btn" onclick="handleUseSkill()">▶ Use Skill</button>
       </div>`;
     body.querySelectorAll('pre code').forEach(block => hljs.highlightElement(block));
   } catch (e) {
@@ -3382,6 +3390,8 @@ async function openSkill(skillPath, skillName, el) {
 }
 
 async function handleUseSkill(skillName, skillContent) {
+  skillName = skillName ?? activeSkillPath?.split('/').pop() ?? '';
+  skillContent = skillContent ?? activeSkillContent ?? '';
   if (window.currentUser?.role === 'guest') {
     const chatId = state.currentChat?.id;
     if (!chatId) { showToast('Open a chat first'); return; }
@@ -3406,7 +3416,15 @@ async function handleUseSkill(skillName, skillContent) {
 function closeSkillViewer() {
   document.getElementById('skills-viewer').style.display = 'none';
   activeSkillPath = null;
+  activeSkillContent = null;
   document.querySelectorAll('.skill-item').forEach(i => i.classList.remove('active'));
+}
+
+function addActiveSkillToFolder() {
+  if (!activeSkillPath) return;
+  const idx = allSkills.findIndex(s => s.path === activeSkillPath);
+  if (idx === -1) return;
+  moveSkillToFolder(idx);
 }
 
 // --- Search ---

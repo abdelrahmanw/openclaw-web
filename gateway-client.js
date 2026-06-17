@@ -15,8 +15,9 @@ const WS = (() => {
 })();
 
 const HOME = process.env.HOME || '/home/clawdbot';
-const OPENCLAW_JSON = path.join(HOME, '.openclaw', 'openclaw.json');
-const DEVICE_JSON   = path.join(HOME, '.openclaw', 'identity', 'device.json');
+const OPENCLAW_JSON  = path.join(HOME, '.openclaw', 'openclaw.json');
+const DEVICE_JSON    = path.join(HOME, '.openclaw', 'identity', 'device.json');
+const DEVICE_AUTH_JSON = path.join(HOME, '.openclaw', 'identity', 'device-auth.json');
 const GATEWAY_WS    = 'ws://127.0.0.1:18789/';
 
 const SCOPES = [
@@ -30,7 +31,8 @@ function normalizeDeviceMeta(v) {
 }
 
 function buildAuthPayload(params) {
-  return ['v4', params.deviceId, 'cli', 'cli', 'operator',
+  // Must be v3 — matches buildDeviceAuthPayloadV3 in openclaw dist/client-5XIBFtwk.js
+  return ['v3', params.deviceId, 'cli', 'cli', 'operator',
     SCOPES.join(','), String(params.signedAtMs),
     params.token ?? '', params.nonce,
     normalizeDeviceMeta('linux'), ''
@@ -56,10 +58,18 @@ function publicKeyRawBase64Url(pem) {
  */
 function createGatewayClient() {
   const config = JSON.parse(fs.readFileSync(OPENCLAW_JSON, 'utf8'));
-  const TOKEN  = config.gateway?.auth?.token;
+  // WS bearer: gateway auth token from openclaw.json
+  const WS_TOKEN = config.gateway?.auth?.token;
+  // Device auth token: operator token from device-auth.json (used in signed payload)
+  let DEVICE_TOKEN = WS_TOKEN; // fallback
+  try {
+    const deviceAuth = JSON.parse(fs.readFileSync(DEVICE_AUTH_JSON, 'utf8'));
+    DEVICE_TOKEN = deviceAuth?.tokens?.operator?.token || WS_TOKEN;
+  } catch (_) {}
+  const TOKEN = DEVICE_TOKEN;
   const device = JSON.parse(fs.readFileSync(DEVICE_JSON, 'utf8'));
 
-  const ws = new WS(GATEWAY_WS, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  const ws = new WS(GATEWAY_WS, { headers: { Authorization: `Bearer ${WS_TOKEN}` } });
 
   let reqId = 0;
   const pending  = new Map();

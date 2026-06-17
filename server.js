@@ -457,27 +457,19 @@ app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
       'INSERT INTO password_reset_tokens (token, user_id, expires_at, used) VALUES (?, ?, ?, 0)',
       [resetToken, user.id, Date.now() + 3600000]
     );
-    // Send email via Gmail API
+    // Send email via shared email module (UTF-8 safe, handles Arabic)
     try {
-      const { google } = require('googleapis');
-      const creds = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.openclaw', 'workspace', 'google-creds.json')));
-      const tokenData = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.openclaw', 'workspace', 'google-token.json')));
-      const installed = creds.installed || creds.web || creds;
-      const oauth2 = new google.auth.OAuth2(
-        installed.client_id, installed.client_secret,
-        (installed.redirect_uris || ['urn:ietf:wg:oauth:2.0:oob'])[0]
-      );
-      oauth2.setCredentials(tokenData);
-      const gmail = google.gmail({ version: 'v1', auth: oauth2 });
-      const rawEmail = [
-        'From: ' + (process.env.ADMIN_EMAIL || 'admin@example.com') + '',
-        `To: ${user.email}`,
-        'Content-Type: text/plain; charset=utf-8',
-        `Subject: Reset your ${getInstanceConfig().name} password`,
-        '',
-        `Reset link:\n${getInstanceConfig().url}/reset-password?token=${resetToken}\n\nExpires in 1 hour.`
-      ].join('\r\n');
-      await gmail.users.messages.send({ userId: 'me', requestBody: { raw: Buffer.from(rawEmail).toString('base64url') } });
+      const { sendEmail } = require('./email');
+      const { name: _instanceName, url: _instanceUrl } = getInstanceConfig();
+      await sendEmail({
+        to: user.email,
+        subject: `Reset your ${_instanceName} password`,
+        body: [
+          `Reset link: ${_instanceUrl}/reset-password?token=${resetToken}`,
+          '',
+          'Expires in 1 hour.'
+        ].join('\n')
+      });
       console.log(`[auth] Password reset email sent to ${user.email}`);
     } catch (mailErr) {
       console.error('[auth] Failed to send reset email:', mailErr.message);
@@ -567,8 +559,8 @@ function getOpenAIClient() {
     const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
     if (m) extraEnv[m[1]] = m[2].replace(/^["']|["']$/g, '');
   }
-  const apiKey = extraEnv.LITELLM_API_KEY || extraEnv.OPENAI_API_KEY || process.env.LITELLM_API_KEY || process.env.OPENAI_API_KEY;
-  const baseURL = extraEnv.OPENAI_BASE_URL || extraEnv.LITELLM_BASE_URL || process.env.OPENAI_BASE_URL || process.env.LITELLM_BASE_URL || 'http://143.198.136.126:4000';
+  const apiKey = extraEnv.OPENAI_API_KEY || process.env.OPENAI_API_KEY || extraEnv.LITELLM_API_KEY || process.env.LITELLM_API_KEY;
+  const baseURL = extraEnv.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || 'https://gateway.ai.cloudflare.com/v1/3724a3e71944b366a39b3735aa117a58/accord-antar/openai';
   if (!apiKey) return null;
   const OpenAI = require('openai');
   return new OpenAI({ apiKey, baseURL });
@@ -579,7 +571,7 @@ async function generateChatTitle(userMessage, aiReply) {
   if (!openai) return null;
   try {
     const titleRes = await openai.chat.completions.create({
-      model: 'anthropic/claude-sonnet-4-6',
+      model: 'gpt-5.5',
       max_tokens: 20,
       messages: [
         { role: 'system', content: 'Generate a short title (5 words max) for this chat. Return ONLY the title, no quotes, no punctuation at the end, no explanation.' },
@@ -973,6 +965,13 @@ function runAgentViaGateway(chat, fullMessage, aiMsgId, sessionKey) {
     });
 
     gw.ready
+      // Patch the session to use Claude Sonnet (200K context) instead of the
+      // gateway default deepseek/deepseek-chat (64K) — avoids context overflow
+      // from small prompts on long-running web sessions.
+      .then(() => gw.request('sessions.patch', {
+        key: sessionKey,
+        model: 'cloudflare-ai-gateway/claude-sonnet-4-6',
+      }))
       .then(() => gw.request('chat.send', {
         sessionKey,
         message: fullMessage,
@@ -1748,10 +1747,16 @@ app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
   console.log(`[transcribe] received file: ${req.file.originalname}, size: ${req.file.size}, path: ${req.file.path}`);
   try {
     const OpenAI = require('openai');
-    // Whisper must go to real OpenAI, not the LiteLLM proxy
-    const apiKey = process.env.OPENAI_API_KEY || process.env.LITELLM_API_KEY;
+    // Whisper via CF AI Gateway openai route (audio/transcriptions is proxied; verified 2026-06-13).
+    // Key + base are read fresh from ~/.openclaw/.env like getOpenAIClient(); the pm2-saved
+    // process.env.OPENAI_BASE_URL still points at the dead LiteLLM proxy, so it is NOT used here.
+    const envLines = (() => { try { return fs.readFileSync(path.join(process.env.HOME || '/home/clawdbot', '.openclaw', '.env'), 'utf8').split('\n'); } catch { return []; } })();
+    const extraEnv = {};
+    for (const line of envLines) { const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/); if (m) extraEnv[m[1]] = m[2].replace(/^["']|["']$/g, ''); }
+    const apiKey = extraEnv.OPENAI_API_KEY || process.env.OPENAI_API_KEY || extraEnv.LITELLM_API_KEY || process.env.LITELLM_API_KEY;
     if (!apiKey) return res.status(500).json({ error: 'No OpenAI API key configured' });
-    const openai = new OpenAI({ apiKey, baseURL: 'https://api.openai.com/v1', timeout: 120000 });
+    const baseURL = extraEnv.OPENAI_WHISPER_BASE_URL || extraEnv.OPENAI_BASE_URL || 'https://gateway.ai.cloudflare.com/v1/3724a3e71944b366a39b3735aa117a58/accord-antar/openai';
+    const openai = new OpenAI({ apiKey, baseURL, timeout: 120000 });
     console.log(`[transcribe] calling whisper...`);
     const transcription = await openai.audio.transcriptions.create({
       file: fs.createReadStream(req.file.path),
