@@ -904,7 +904,7 @@ app.post('/api/chats/:id/send-voice-reply', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-const OPENCLAW_BIN = '/data/.npm-global/bin/openclaw';
+const OPENCLAW_BIN = '/usr/bin/openclaw';
 
 // Streaming agent run via the gateway WebSocket (chat.send + chat delta events).
 // The gateway streams cumulative, cleaned assistant text (tool/thinking chatter is
@@ -971,6 +971,8 @@ function runAgentViaGateway(chat, fullMessage, aiMsgId, sessionKey) {
       .then(() => gw.request('sessions.patch', {
         key: sessionKey,
         model: 'cloudflare-ai-gateway/claude-sonnet-4-6',
+        thinkingLevel: 'off',  // disable thinking for web sessions — prevents "thinking blocks cannot be modified" errors
+                               // caused by consecutive assistant messages after sessions_yield + subagent announce
       }))
       .then(() => gw.request('chat.send', {
         sessionKey,
@@ -2663,9 +2665,13 @@ app.get('/oauth2callback', async (req, res) => {
     const { google } = require('googleapis');
     const creds = JSON.parse(fs.readFileSync('/home/clawdbot/.openclaw/workspace/google-creds.json'));
     const installed = creds.installed || creds.web || creds;
+    const { url: instanceUrl } = getInstanceConfig();
+    const redirectUri = instanceUrl
+      ? instanceUrl.replace(/\/$/, '') + '/oauth2callback'
+      : 'https://your-agent-url/oauth2callback';
     const oauth2 = new google.auth.OAuth2(
       installed.client_id, installed.client_secret,
-      'https://your-agent-url/oauth2callback'
+      redirectUri
     );
     const { tokens } = await oauth2.getToken(code);
     fs.writeFileSync('/home/clawdbot/.openclaw/workspace/google-token.json', JSON.stringify(tokens));

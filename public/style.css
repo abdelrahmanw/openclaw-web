@@ -906,8 +906,16 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
   }
   /* Push messages below fixed header */
   #messages-area { padding-top: calc(44px + 16px) !important; }
-  /* Push input area above Android nav bar */
-  #input-area { position: relative; z-index: 9; }
+  /* Pin input area to bottom of viewport on mobile */
+  #input-area {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 9;
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+  }
   .chat-title-display {
     font-size: 12px;
     min-width: 0;
@@ -928,8 +936,8 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
     padding: 8px 10px;
     padding-bottom: max(10px, env(safe-area-inset-bottom));
   }
-  .input-row { padding: 8px 10px; border-radius: 14px; }
-  #msg-input { font-size: 16px; min-width: 0; flex: 1 1 0; max-height: 100px; } /* prevent iOS zoom, cap height */
+  .input-row { padding: 8px 10px; border-radius: 14px; flex-wrap: wrap; justify-content: space-between; }
+  #msg-input { font-size: 16px; min-width: 0; flex: 0 0 100%; order: -1; max-height: 100px; } /* full width top row on mobile, prevent iOS zoom */
   /* Stop button: full width centered row on mobile when generating */
   .input-row.generating {
     flex-direction: row;
@@ -997,9 +1005,13 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
     padding-right: env(safe-area-inset-right);
   }
 
-  /* Keyboard-aware layout: let the input area float up with keyboard */
+  /* Keyboard-aware layout: safe-area padding for notched phones */
   #input-area {
     padding-bottom: max(10px, env(safe-area-inset-bottom));
+  }
+  /* Compensate messages area for fixed input bar (approx 80px) */
+  #messages-area {
+    padding-bottom: 90px !important;
   }
 }
 

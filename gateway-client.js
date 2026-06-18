@@ -149,6 +149,7 @@ function createGatewayClient() {
   }
 
   return {
+    _ws: ws,
     ready,
     async request(method, params) {
       await ready;

@@ -1419,7 +1419,9 @@ function sendFollowUp() {
 }
 
 function handleKey(e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); return; }
+  const isMobile = window.innerWidth < 768;
+  if (e.key === 'Enter' && !e.shiftKey && !isMobile) { e.preventDefault(); sendMessage(); return; }
+  if (e.key === 'Enter' && !e.shiftKey && isMobile) { /* new line on mobile, send via button */ return; }
   // Fire typing ping for collaborative chats (Phase 3)
   if (state.currentChat) pingTyping(state.currentChat.id);
 }
