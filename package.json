@@ -4,7 +4,8 @@
   "description": "Claude.ai-style web UI for your OpenClaw agent",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "mocha test/transcript-tools.test.js"
   },
   "overrides": {
     "sqlite3": "^6.0.1",
@@ -27,5 +28,9 @@
     "sql.js": "^1.14.1",
     "sqlite3": "^6.0.1",
     "ws": "^8.20.1"
+  },
+  "devDependencies": {
+    "chai": "^6.2.2",
+    "mocha": "^11.7.6"
   }
 }

@@ -2,6 +2,7 @@
  * gateway-client.js
  * Reusable OpenClaw Gateway WebSocket client.
  * Handles auth handshake and exposes request/subscribe helpers.
+ * v2: Supports caps, reconnection, and shared persistent connection.
  */
 
 const path = require('path');
@@ -24,6 +25,9 @@ const SCOPES = [
   'operator.admin','operator.read','operator.write',
   'operator.approvals','operator.pairing','operator.talk.secrets'
 ];
+
+// Connection-level timeline
+let connectionGeneration = 0;
 
 function normalizeDeviceMeta(v) {
   if (!v || typeof v !== 'string') return '';
@@ -55,13 +59,12 @@ function publicKeyRawBase64Url(pem) {
  *   - on(eventName, handler)  — listen to broadcast events
  *   - close()
  *   - ready                  — Promise that resolves when connected+authed
+ *   - generation             — monotonic connection id (increments on each connect)
  */
-function createGatewayClient() {
+function createGatewayClient(opts = {}) {
   const config = JSON.parse(fs.readFileSync(OPENCLAW_JSON, 'utf8'));
-  // WS bearer: gateway auth token from openclaw.json
   const WS_TOKEN = config.gateway?.auth?.token;
-  // Device auth token: operator token from device-auth.json (used in signed payload)
-  let DEVICE_TOKEN = WS_TOKEN; // fallback
+  let DEVICE_TOKEN = WS_TOKEN;
   try {
     const deviceAuth = JSON.parse(fs.readFileSync(DEVICE_AUTH_JSON, 'utf8'));
     DEVICE_TOKEN = deviceAuth?.tokens?.operator?.token || WS_TOKEN;
@@ -69,22 +72,36 @@ function createGatewayClient() {
   const TOKEN = DEVICE_TOKEN;
   const device = JSON.parse(fs.readFileSync(DEVICE_JSON, 'utf8'));
 
+  const generation = ++connectionGeneration;
+
+  // Extract caps. Caps make the Gateway send extra events during agent runs.
+  const caps = opts.caps || [];
+
   const ws = new WS(GATEWAY_WS, { headers: { Authorization: `Bearer ${WS_TOKEN}` } });
 
   let reqId = 0;
   const pending  = new Map();
-  const handlers = new Map(); // eventName → Set<fn>
+  const handlers = new Map();
+  let _closed = false;
 
   let resolveReady, rejectReady;
   const ready = new Promise((res, rej) => { resolveReady = res; rejectReady = rej; });
 
+  const timeout = setTimeout(() => {
+    rejectReady(new Error('gateway connect timeout'));
+  }, 15000);
+
   ws.on('error', (e) => {
+    _closed = true;
+    clearTimeout(timeout);
     rejectReady(e);
     for (const [, h] of pending) h.reject(e);
     pending.clear();
   });
 
   ws.on('close', () => {
+    _closed = true;
+    clearTimeout(timeout);
     const err = new Error('gateway ws closed');
     for (const [, h] of pending) h.reject(err);
     pending.clear();
@@ -106,6 +123,7 @@ function createGatewayClient() {
 
     // --- Auth challenge ---
     if (frame.type === 'event' && frame.event === 'connect.challenge') {
+      clearTimeout(timeout);
       const nonce = frame.payload?.nonce;
       const signedAtMs = Date.now();
       const payloadStr = buildAuthPayload({ deviceId: device.deviceId, token: TOKEN, nonce, signedAtMs });
@@ -114,7 +132,9 @@ function createGatewayClient() {
         await _request('connect', {
           minProtocol: 4, maxProtocol: 4,
           client: { id: 'cli', version: '2026.5.28', platform: 'linux', mode: 'cli' },
-          auth: { token: TOKEN }, scopes: SCOPES, role: 'operator',
+          caps: caps.length > 0 ? caps : void 0,
+          auth: { token: TOKEN },
+          scopes: SCOPES, role: 'operator',
           device: {
             id: device.deviceId,
             publicKey: publicKeyRawBase64Url(device.publicKeyPem),
@@ -130,7 +150,6 @@ function createGatewayClient() {
     if (frame.type === 'event') {
       const set = handlers.get(frame.event);
       if (set) for (const fn of set) fn(frame.payload, frame);
-      // Also fire wildcard
       const all = handlers.get('*');
       if (all) for (const fn of all) fn(frame.payload, frame);
     }
@@ -151,6 +170,8 @@ function createGatewayClient() {
   return {
     _ws: ws,
     ready,
+    generation,
+    get connected() { return !_closed && ws.readyState === 1; },
     async request(method, params) {
       await ready;
       return _request(method, params);
@@ -158,9 +179,9 @@ function createGatewayClient() {
     on(eventName, handler) {
       if (!handlers.has(eventName)) handlers.set(eventName, new Set());
       handlers.get(eventName).add(handler);
-      return () => handlers.get(eventName)?.delete(handler); // returns unsubscribe fn
+      return () => handlers.get(eventName)?.delete(handler);
     },
-    close() { try { ws.close(); } catch {} },
+    close() { clearTimeout(timeout); try { ws.close(); } catch {} },
   };
 }
 

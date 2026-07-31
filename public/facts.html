@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, shrink-to-fit=no">
+<title>Facts · Meshmesh</title>
+<style>
+:root { color-scheme: dark; }
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* Dark mode (default) */
+:root {
+  --bg: #1a1a1a;
+  --surface: #2a2a2a;
+  --surface2: #303030;
+  --border: #3a3a3a;
+  --accent: #2563EB;
+  --text: #ececec;
+  --text-muted: #888;
+  --text-dim: #aaa;
+  --danger: #ef4444;
+  --success: #22c55e;
+}
+
+/* Light mode — uses :root.light from meshmesh-web */
+:root.light {
+  --bg: #faf9f5;
+  --surface: #e8e3d8;
+  --surface2: #ddd8cc;
+  --border: #ccc8be;
+  --accent: #2563EB;
+  --text: #1a1a18;
+  --text-muted: #6b6860;
+  --text-dim: #7a766c;
+  --danger: #dc2626;
+  --success: #16a34a;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Inter', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  margin: 0;
+  padding: 0;
+  transition: background 0.2s, color 0.2s;
+}
+
+/* Header */
+.header {
+  border-bottom: 1px solid var(--border);
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.header h1 { font-size: 18px; font-weight: 700; color: var(--text); }
+.header .subtitle { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.header a { color: var(--accent); text-decoration: none; font-size: 13px; white-space: nowrap; flex-shrink: 0; }
+
+/* Search bar */
+.search-bar { padding: 10px 16px; border-bottom: 1px solid var(--border); }
+.search-bar input {
+  width: 100%; padding: 11px 14px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--surface); color: var(--text);
+  font-size: 15px; font-family: inherit; outline: none;
+  -webkit-appearance: none;
+}
+.search-bar input:focus { border-color: var(--accent); }
+.search-bar input::placeholder { color: var(--text-muted); }
+
+/* Category tabs — horizontal scroll */
+.category-tabs {
+  display: flex; gap: 6px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto; -webkit-overflow-scrolling: touch;
+  scrollbar-width: none; flex-wrap: nowrap;
+}
+.category-tabs::-webkit-scrollbar { display: none; }
+.category-tab {
+  padding: 7px 16px; border-radius: 20px;
+  font-size: 13px; font-weight: 500; cursor: pointer; font-family: inherit;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--text-muted); white-space: nowrap; flex-shrink: 0;
+  transition: all .15s;
+}
+.category-tab:hover { border-color: var(--accent); color: var(--text); }
+.category-tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.count-badge {
+  background: var(--surface); border-radius: 10px; padding: 1px 8px;
+  font-size: 11px; margin-left: 5px; color: var(--text-muted);
+}
+.category-tab.active .count-badge { background: rgba(255,255,255,.2); color: rgba(255,255,255,.85); }
+
+/* Table wrapper — horizontal scroll */
+.table-wrapper {
+  overflow-x: auto; -webkit-overflow-scrolling: touch;
+}
+
+/* Table */
+.facts-table {
+  min-width: 640px;
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.facts-table thead { position: sticky; top: 0; background: var(--bg); z-index: 1; }
+.facts-table th {
+  text-align: left; padding: 11px 12px;
+  border-bottom: 2px solid var(--border);
+  color: var(--text-muted); font-weight: 600;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+  cursor: pointer; user-select: none; white-space: nowrap;
+}
+.facts-table th:hover { color: var(--text); }
+.facts-table th .sort-arrow { display: inline-block; margin-left: 4px; font-size: 10px; opacity: .6; }
+.facts-table .td-status { white-space: nowrap; width: 90px; }
+.facts-table td {
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top; line-height: 1.5;
+}
+.facts-table tbody tr:active { background: var(--surface); }
+.facts-table .td-cat { white-space: nowrap; color: var(--text-muted); font-size: 11px; width: 100px; }
+.facts-table .td-title { font-weight: 600; color: var(--text); width: 140px; }
+.facts-table .td-detail { color: var(--text-dim); white-space: pre-wrap; word-break: break-word; }
+.fact-update-btn {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 10px; border-radius: 7px; cursor: pointer; font-family: inherit;
+  font-size: 11px; font-weight: 600; white-space: nowrap;
+  border: 1px solid var(--accent); background: transparent; color: var(--accent);
+  transition: all .15s;
+}
+.fact-update-btn:hover { background: var(--accent); color: #fff; }
+.fact-status-inline { display: inline-flex; align-items: center; gap: 6px; }
+.secret-placeholder { color: var(--danger); font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; }
+
+/* Empty state */
+.empty-state { text-align: center; padding: 60px 24px; color: var(--text-muted); }
+.empty-state h3 { margin: 0 0 8px; color: var(--text); font-size: 16px; }
+.empty-state p { font-size: 13px; }
+
+/* Mobile */
+@media (max-width: 640px) {
+  .header { flex-direction: column; align-items: stretch; gap: 6px; }
+  .header h1 { font-size: 16px; }
+  .header .subtitle { font-size: 11px; }
+  .facts-table { font-size: 12px; }
+  .facts-table th, .facts-table td { padding: 9px 8px; }
+  .facts-table .td-cat { font-size: 11px; width: 80px; }
+  .facts-table .td-title { width: 110px; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>Meshmesh Facts</h1>
+    <div class="subtitle">Catalog of known configs, credentials &amp; workflows</div>
+  </div>
+  <a href="/">← Back to Chat</a>
+</div>
+
+<div class="search-bar">
+  <input type="text" id="search" placeholder="Search facts…" oninput="renderFacts()" autocomplete="off">
+</div>
+
+<div class="category-tabs" id="tabs"></div>
+
+<div class="table-wrapper">
+  <div id="container" style="padding:20px 16px;">
+    <div class="empty-state"><h3>Loading facts…</h3></div>
+  </div>
+</div>
+
+<script>
+const FACTS = [
+  { id:"moldova-ssh", category:"Server Access", icon:"🖥️", title:"Moldova Server — SSH", detail:"Host: 217.156.8.100\nUser: root (old) / deploy (current)\nPort: 22 (old) / 22666 (current, key auth)\nKey path (Hostinger): /data/.ssh/moldova\nPersistent tunnel via autossh forwarding all arr ports.", secret:false },
+  { id:"moldova-deploy-pass", category:"Server Access", icon:"🔑", title:"Moldova — Deploy Password", detail:"Deploy user password stored in memory recall. Ask Meshmesh: 'moldova deploy user password'.", secret:true, hint:"Encrypted — ask Meshmesh" },
+  { id:"ssh-tunnel", category:"Server Access", icon:"🔗", title:"SSH Tunnel", detail:"ssh -L 7878:127.0.0.1:7878 -L 8989:127.0.0.1:8989 -L 9696:127.0.0.1:9696 -L 8085:127.0.0.1:8085 root@217.156.8.100\n(Use deploy@22666 for new setup)", secret:false },
+  { id:"arrstack-mcp", category:"Server Access", icon:"🔌", title:"Arrstack MCP", detail:"http://217.156.8.100:8000/mcp\nRestricted via UFW source IP + IPv6.", secret:false },
+  { id:"jellyfin", category:"Media Server", icon:"🎬", title:"Jellyfin", detail:"https://jellyfin.abdowahba.me\nAdmin: adminAW", secret:true, hint:"Encrypted — ask Meshmesh" },
+  { id:"radarr", category:"Media Server", icon:"🎥", title:"Radarr / Sonarr / Prowlarr", detail:"All on Moldova (217.156.8.100).\nAPI keys in memory recall.", secret:true, hint:"Encrypted — ask Meshmesh" },
+  { id:"qbit", category:"Media Server", icon:"⬇️", title:"qBittorrent", detail:"Port 8085 via Gluetun VPN.\nHTTPS: https://qbt.abdowahba.me\nUser: admin\nExternal access blocked via iptables.", secret:true, hint:"Encrypted — ask Meshmesh" },
+  { id:"google-accounts", category:"Google Workspace", icon:"📧", title:"Google Account Aliases", detail:"4 accounts (OAuth tokens):\n• abdo — personal\n• pcb — Product Camp Berlin\n• accord — Accord Partners\n• gmail — GMail", secret:false },
+  { id:"coaching-invoices", category:"Google Workspace", icon:"📄", title:"Invoices Folder", detail:"Drive folder: 1JgUOOboLPSDs4eCi86Q-g6iF5FTncDy4\nUse google-workspace-intake skill.", secret:false },
+  { id:"asana", category:"APIs & Services", icon:"📋", title:"Asana", detail:"Personal: me@abdowahba.com\nAccord: abdo@accordpartners.ai\nAPI keys in memory recall.", secret:true, hint:"Encrypted — ask Meshmesh" },
+  { id:"dropbox", category:"APIs & Services", icon:"📦", title:"Dropbox", detail:"Token at dropbox-access-token.txt\nAuto-refresh enabled.\nPreferred: Invoices/YYYY/{Cat}/{Vendor}/", secret:false },
+  { id:"pipedrive", category:"APIs & Services", icon:"💼", title:"Pipedrive CRM", detail:"User ID: 24659421. Company: Self-employed.\nAPI token in memory recall.", secret:true, hint:"Encrypted — ask Meshmesh" },
+  { id:"trello", category:"APIs & Services", icon:"📌", title:"Trello (SessionPlanner)", detail:"Board ID: 69c975eede47a0d0755b7627\nAPI key + token in memory recall.", secret:true, hint:"Encrypted — ask Meshmesh" },
+  { id:"tito", category:"APIs & Services", icon:"🎟️", title:"Tito (AI Camp Berlin)", detail:"abdo@productcampberlin.org\nPassword in memory recall.", secret:true, hint:"Encrypted — ask Meshmesh" },
+  { id:"ticktick", category:"APIs & Services", icon:"✅", title:"TickTick (Maton)", detail:"Skill: skills/ticktick-api-skill/\nMaton API key in memory recall.", secret:true, hint:"Encrypted — ask Meshmesh" },
+  { id:"github", category:"APIs & Services", icon:"🐙", title:"GitHub", detail:"Account: abdelrahmanw (id 32943707)\nPAT token (scope: repo) stored in memory recall.\nAccess via HTTP API: Authorization: token <PAT>\nRepo: abdelrahmanw/openclaw-web", secret:true, hint:"Encrypted — ask Meshmesh" },
+  { id:"env-keys", category:"APIs & Services", icon:"🔐", title:"Env Var Keys", detail:"OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, GEMINI_API_KEY, OXYLABS_AISTUDIO_API_KEY, OPENCLAW_GATEWAY_TOKEN, MATON_API_KEY", secret:false },
+  { id:"namecheap", category:"APIs & Services", icon:"🌐", title:"Namecheap API", detail:"For DNS on abdowahba.me\nCredentials in memory recall.", secret:true, hint:"Encrypted — ask Meshmesh" },
+  { id:"skills", category:"Config & Skills", icon:"🧰", title:"Available Skills", detail:"1. coaching-invoice-generator\n2. feedback-form-aggregation\n3. google-workspace-intake\n4. meshmesh-market-search\n5. moldova-media-server\n6. oldtimer-deutsche-post-csv\n7. oldtimer-word-workflow\n8. product-feedback-to-sheet-and-trello\nAll in skills/ directory.", secret:false },
+  { id:"model-lock", category:"Config & Skills", icon:"🤖", title:"Model Lock", detail:"Default: DeepSeek Chat (deepseek/deepseek-v4-flash).\nNever switch without Abdo approval.", secret:false },
+  { id:"encoding", category:"Config & Skills", icon:"🔤", title:"Character Encoding", detail:"Always UTF-8. German (ä,ö,ü,ß) and Arabic must display correctly. No encoding artifacts.", secret:false },
+  { id:"subagent", category:"Config & Skills", icon:"🧩", title:"Sub-Agent Strategy", detail:"Spawn for: Google Drive, email, docs, data retrieval, Google Workspace, multi-step, workflows, multi-step skills, anything blocking main session.", secret:false },
+  { id:"backup", category:"Config & Skills", icon:"💾", title:"Backup Schedule", detail:"Tuesdays & Fridays only.\n→ Google Drive 'Meshmesh Backups' folder.\nTimestamps in folder names.", secret:false },
+  { id:"meshmesh-web", category:"Config & Skills", icon:"🌍", title:"Meshmesh Web UI", detail:"https://meshmesh.abdowahba.me\nTraefik + Let's Encrypt on Hostinger.\nPM2: openclaw-web", secret:false },
+  { id:"browser-setup", category:"Config & Skills", icon:"🖥️", title:"Browser Setup", detail:"Xvfb :99, x11vnc 5900, noVNC 6080.\nChromium at DISPLAY=:99", secret:false },
+  { id:"tailscale", category:"Config & Skills", icon:"🔒", title:"Tailscale Sidecar", detail:"meshmesh-hostinger (100.71.162.25).\nSOCKS5 172.18.0.5:1080 → Samsung S9 FE exit node.", secret:false },
+  { id:"tito-sync", category:"Workflows", icon:"🔄", title:"Tito → Sheet Sync", detail:"Trigger: 'tito sync'\nSyncs tickets + discount codes.\nSmart update (bold changed cells).", secret:false },
+  { id:"apartment", category:"Other", icon:"🏠", title:"Berlin Apartment", detail:"Kaiser-Wilhelm-Str. 109 A\nWarm rent: 1,683 EUR (base 1,073+utils 342+elec 96+net 62+buffer 110)\nMax 3yr. Deposit 3,219 EUR. Cost-covering.", secret:false },
+  { id:"audio-transcribe", category:"Other", icon:"🎤", title:"Audio Transcription", detail:"Auto-transcribe Telegram voice notes.\nPrefer DeepSeek. React after transcribing.", secret:false },
+];
+
+const CATEGORIES = [...new Set(FACTS.map(f => f.category))];
+
+// Sorting state: { key: 'category'|'title'|'detail'|'status', dir: 1|-1, null = unsorted }
+let sortState = null;
+
+function openFactUpdate(f) {
+  // Build a prompt referencing this specific fact row, hand it to a new chat in the "meshmeshweb" project.
+  const prompt = 'Please look up the recorded fact \u0022' + f.title + '\u0022 (' + f.category + ') in the Meshmesh facts catalog.\n' +
+    'Current recorded details:\n' + f.detail + '\n\n' +
+    'Update the recorded information for this row if it is out of date or incorrect, or help me with my question about this specific row.';
+  const url = '/?newChatInProject=' + encodeURIComponent('Meshmesh Web') + '&prompt=' + encodeURIComponent(prompt);
+  window.open(url, '_blank');
+}
+
+function renderFacts() {
+  const q = document.getElementById('search').value.toLowerCase();
+  const active = document.querySelector('.category-tab.active')?.dataset?.cat || 'all';
+  let filtered = FACTS.filter(f =>
+    (!q || f.title.toLowerCase().includes(q) || f.detail.toLowerCase().includes(q) || f.category.toLowerCase().includes(q)) &&
+    (active === 'all' || f.category === active)
+  );
+
+  // Apply sorting
+  if (sortState) {
+    const { key, dir } = sortState;
+    filtered = filtered.slice().sort((a, b) => {
+      let av = a[key], bv = b[key];
+      // Status column sorts by secret (locked last) then by title for stability
+      if (key === 'status') { av = a.secret ? 1 : 0; bv = b.secret ? 1 : 0; }
+      av = (av == null ? '' : String(av)).toLowerCase();
+      bv = (bv == null ? '' : String(bv)).toLowerCase();
+      if (av < bv) return -1 * dir;
+      if (av > bv) return 1 * dir;
+      return 0;
+    });
+  }
+
+  const c = document.getElementById('container');
+  if (!filtered.length) {
+    c.innerHTML = '<div class="empty-state"><h3>No facts found</h3><p>Try a different search or category.</p></div>';
+    return;
+  }
+
+  function arrow(key) {
+    if (!sortState || sortState.key !== key) return '';
+    return '<span class="sort-arrow">' + (sortState.dir === 1 ? '▲' : '▼') + '</span>';
+  }
+
+  let html = '<table class="facts-table"><thead><tr>' +
+    '<th onclick="sortFacts(\'category\')">Category' + arrow('category') + '</th>' +
+    '<th onclick="sortFacts(\'title\')">Title' + arrow('title') + '</th>' +
+    '<th onclick="sortFacts(\'detail\')">Details' + arrow('detail') + '</th>' +
+    '<th onclick="sortFacts(\'status\')">Status' + arrow('status') + '</th>' +
+    '</tr></thead><tbody>';
+  for (const f of filtered) {
+    const d = f.detail.replace(/\n/g, '<br>');
+    const statusHTML = f.secret ? '<span class="secret-placeholder">🔒 Ask Meshmesh</span>' : '<span style="color:var(--success)">✓</span>';
+    const s = '<span class="fact-status-inline">' + statusHTML +
+      '<button class="fact-update-btn" onclick="openFactUpdate(FACTS.find(x=>x.id===\'' + f.id + '\'))" title="Ask to update this fact">✎ Update</button></span>';
+    html += `<tr><td class="td-cat">${f.icon||''} ${f.category}</td><td class="td-title">${f.title}</td><td class="td-detail">${d}</td><td class="td-status">${s}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  c.innerHTML = html;
+}
+
+function sortFacts(key) {
+  if (sortState && sortState.key === key) {
+    sortState.dir = sortState.dir === 1 ? -1 : 1; // toggle asc/desc
+  } else {
+    sortState = { key, dir: 1 };
+  }
+  renderFacts();
+}
+
+function renderTabs() {
+  let html = '<div class="category-tab active" data-cat="all" onclick="setCategory(\'all\')">All <span class="count-badge">'+FACTS.length+'</span></div>';
+  for (const cat of CATEGORIES) {
+    const n = FACTS.filter(f=>f.category===cat).length;
+    html += '<div class="category-tab" data-cat="'+cat+'" onclick="setCategory(\''+cat.replace(/'/g,"\\'")+'\')">'+cat+' <span class="count-badge">'+n+'</span></div>';
+  }
+  document.getElementById('tabs').innerHTML = html;
+}
+
+// Sync theme with meshmesh-web
+(function() {
+  const saved = localStorage.getItem('openclaw-theme');
+  if (saved === 'light') document.documentElement.classList.add('light');
+})();
+
+function setCategory(cat) {
+  document.querySelectorAll('.category-tab').forEach(t => t.classList.toggle('active', t.dataset.cat === cat));
+  renderFacts();
+}
+
+renderTabs();
+renderFacts();
+</script>
+</body>
+</html>

@@ -57,7 +57,10 @@
     <div class="sidebar-header">
       <div class="logo"><div class="logo-icon">🤖</div> <span id="sidebar-instance-name">Antar</span></div>
       <button class="new-chat-btn" onclick="newChat()">+ New Chat</button>
-      <input type="text" class="sidebar-search" placeholder="Search chats..." oninput="filterChats(this.value)" id="search-input"/>
+      <div class="search-input-wrap" style="position:relative;width:100%;margin-top:8px">
+      <input type="text" class="sidebar-search" placeholder="Search chats..." oninput="filterChats(this.value)" id="search-input" style="margin-top:0;width:100%"/>
+      <span id="search-spinner" class="search-spinner" style="display:none"></span>
+    </div>
     </div>
     <div class="sidebar-nav">
       <button class="nav-tab active" onclick="showTab('chats',this)">Chats</button>
@@ -83,7 +86,7 @@
       <div class="header-right">
         <!-- New chat in project (context-aware) -->
         <div id="header-actions" style="display:none">
-          <button class="header-btn new-project-chat-btn" id="new-project-chat-btn" onclick="newChatInCurrentProject()" style="display:none" title="Start a new chat in this project">＋ New chat</button>
+          <button class="header-btn new-project-chat-btn" id="new-project-chat-btn" onclick="newChatInCurrentProject()" style="display:none" title="Start a new chat in this project">＋ Chat</button>
           <!-- Invite dropdown (managed by updateCollabUI) -->
           <div class="invite-dropdown-wrap" id="invite-dropdown-wrap" style="display:none; position:relative">
             <button class="collab-btn" id="collab-lock-btn" onclick="toggleInviteDropdown()" title="Invite users to this chat">👥 Invite</button>
@@ -100,7 +103,11 @@
             <button class="tools-menu-item" onclick="toggleSkillsPanel(); closeToolsMenu()" id="skills-toggle-btn">Skills</button>
             <button class="tools-menu-item" onclick="toggleCorePanel(); closeToolsMenu()" id="core-toggle-btn">Core</button>
             <hr class="tools-menu-divider"/>
+            <button class="tools-menu-item" id="tools-read-chat-btn" onclick="readChatTranscript(); closeToolsMenu()">Read Chat</button>
+            <button class="tools-menu-item" id="tools-summarize-chat-btn" onclick="summarizeChatTranscript(); closeToolsMenu()">Read &amp; summarize</button>
+            <hr class="tools-menu-divider"/>
             <button class="tools-menu-item" onclick="renameAllChats(); closeToolsMenu()" id="rename-all-btn">✨ Rename All</button>
+            <button class="tools-menu-item" onclick="window.open('/facts','_blank'); closeToolsMenu()">📋 Facts</button>
             <button class="tools-menu-item" onclick="toggleTheme(); closeToolsMenu()" id="theme-toggle-btn">🌙 Theme</button>
           </div>
         </div>
