@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "mocha test/transcript-tools.test.js"
+    "test": "mocha test/transcript-tools.test.js test/drop-handler.test.js"
   },
   "overrides": {
     "sqlite3": "^6.0.1",
@@ -31,6 +31,7 @@
   },
   "devDependencies": {
     "chai": "^6.2.2",
+    "jsdom": "^30.0.1",
     "mocha": "^11.7.6"
   }
 }

@@ -1672,10 +1672,25 @@ function applyMessageDelta(data) {
 function setupDragDrop() {
   const area = document.getElementById('input-area');
   if (!area) return;
+  // Delegate to the shared DropHandler module (see drop-handler.js). The
+  // module stops event propagation in the input-area drop handler so the
+  // document-level handler does not re-process the same files — which
+  // previously created a duplicate attachment entry per dropped file.
+  if (window.DropHandler && window.DropHandler.setupDrop) {
+    try {
+      window.DropHandler.setupDrop({ area: area, doc: document, onFiles: handleFiles });
+      return;
+    } catch (err) {
+      console.error('DropHandler.setupDrop failed, using legacy wiring:', err);
+    }
+  }
+  // Legacy fallback wiring (kept so drag-and-drop still works even if the
+  // module is missing or fails to load). Includes the stopPropagation fix.
   area.addEventListener('dragover', e => { e.preventDefault(); area.style.outline = '2px dashed var(--accent)'; });
   area.addEventListener('dragleave', () => { area.style.outline = ''; });
   area.addEventListener('drop', e => {
     e.preventDefault();
+    e.stopPropagation();
     area.style.outline = '';
     handleFiles(e.dataTransfer.files);
   });
