@@ -1,5 +1,6 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const initialFacts = require('./facts-seed');
 
 const DB_PATH = path.join(__dirname, 'antar.db');
 const db = new sqlite3.Database(DB_PATH);
@@ -145,6 +146,28 @@ db.serialize(() => {
   )`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read)`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS facts (
+    id TEXT PRIMARY KEY,
+    category TEXT NOT NULL,
+    icon TEXT,
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    secret INTEGER NOT NULL DEFAULT 0,
+    hint TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  const seedFact = db.prepare(`INSERT OR IGNORE INTO facts
+    (id, category, icon, title, detail, secret, hint, sort_order)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+  for (const fact of initialFacts) {
+    seedFact.run(
+      fact.id, fact.category, fact.icon || null, fact.title, fact.detail,
+      fact.secret ? 1 : 0, fact.hint || null, fact.sort_order
+    );
+  }
+  seedFact.finalize();
 });
 
 module.exports = db;

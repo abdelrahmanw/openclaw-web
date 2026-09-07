@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "mocha test/transcript-tools.test.js test/drop-handler.test.js"
+    "test": "mocha test/*.test.js"
   },
   "overrides": {
     "sqlite3": "^6.0.1",

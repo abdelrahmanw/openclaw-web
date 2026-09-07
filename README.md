@@ -14,6 +14,7 @@ A Claude.ai-style web chat interface for your [OpenClaw](https://openclaw.ai) ag
 - Markdown + code rendering with syntax highlighting
 - Artifact panel for code/documents
 - Skills and Workflows browser
+- Data-backed facts catalog with search, sorting, categories, and inline CRUD
 - Shareable chat links
 - Full-text chat search
 - Dark/light mode
@@ -110,6 +111,39 @@ You can optionally link a web chat to a Telegram session by setting `telegram_se
 | `setup.sh` | One-time setup |
 | `update.sh` | Pull latest + restart |
 | `tunnel.sh` | Cloudflare tunnel launcher (created by setup) |
+
+## Facts catalog
+
+The authenticated `/facts` page stores its catalog in the existing `antar.db` SQLite database. On first boot, the app creates and idempotently seeds the `facts` table from the original built-in catalog; existing rows are never overwritten on later boots.
+
+### Schema
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `TEXT PRIMARY KEY` | Lowercase slug (`[a-z0-9-]+`) |
+| `category` | `TEXT NOT NULL` | Page grouping |
+| `icon` | `TEXT` | Optional emoji glyph |
+| `title` | `TEXT NOT NULL` | Display title |
+| `detail` | `TEXT NOT NULL` | Multi-line content; newlines render as line breaks |
+| `secret` | `INTEGER NOT NULL DEFAULT 0` | `1` hides the row detail behind “🔒 Ask Meshmesh” |
+| `hint` | `TEXT` | Optional text shown for secret rows |
+| `sort_order` | `INTEGER NOT NULL DEFAULT 0` | Default list order |
+| `updated_at` | `TEXT NOT NULL DEFAULT (datetime('now'))` | Refreshed on updates |
+
+### Authenticated REST API
+
+All routes use the same session authentication middleware as the rest of the application.
+
+| Method | Route | Behavior |
+|---|---|---|
+| `GET` | `/api/facts` | List all facts by `sort_order`, then `id` |
+| `GET` | `/api/facts/:id` | Read one fact |
+| `POST` | `/api/facts` | Create a fact |
+| `PUT` | `/api/facts/:id` | Fully replace a fact's editable fields |
+| `PATCH` | `/api/facts/:id` | Update supplied fields only |
+| `DELETE` | `/api/facts/:id` | Delete a fact |
+
+Create requests require `id`, `category`, `title`, and `detail`. Full updates require `category`, `title`, and `detail`; IDs are immutable. Empty required strings, invalid slugs, non-integer sort orders, and invalid boolean values are rejected. UI mutations also notify the OpenClaw agent through the existing gateway client so durable notes can be reconciled; secret details are omitted from that notification.
 
 ## License
 

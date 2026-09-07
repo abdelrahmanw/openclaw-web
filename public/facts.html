@@ -24,6 +24,7 @@
 
 /* Light mode — uses :root.light from meshmesh-web */
 :root.light {
+  color-scheme: light;
   --bg: #faf9f5;
   --surface: #e8e3d8;
   --surface2: #ddd8cc;
@@ -56,7 +57,18 @@ body {
 }
 .header h1 { font-size: 18px; font-weight: 700; color: var(--text); }
 .header .subtitle { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.header-actions { display: flex; align-items: center; gap: 10px; }
 .header a { color: var(--accent); text-decoration: none; font-size: 13px; white-space: nowrap; flex-shrink: 0; }
+.primary-btn, .secondary-btn, .danger-btn {
+  min-height: 34px; padding: 7px 13px; border-radius: 8px; cursor: pointer; font: 600 13px/1 inherit;
+}
+.primary-btn { border: 1px solid var(--accent); background: var(--accent); color: #fff; }
+.secondary-btn { border: 1px solid var(--border); background: transparent; color: var(--text); }
+.danger-btn { border: 1px solid var(--danger); background: transparent; color: var(--danger); }
+.primary-btn:disabled, .secondary-btn:disabled, .danger-btn:disabled { cursor: wait; opacity: .55; }
+.primary-btn:hover:not(:disabled) { filter: brightness(1.08); }
+.secondary-btn:hover:not(:disabled) { border-color: var(--accent); }
+.danger-btn:hover:not(:disabled) { background: var(--danger); color: #fff; }
 
 /* Search bar */
 .search-bar { padding: 10px 16px; border-bottom: 1px solid var(--border); }
@@ -69,6 +81,8 @@ body {
 }
 .search-bar input:focus { border-color: var(--accent); }
 .search-bar input::placeholder { color: var(--text-muted); }
+.inline-status { min-height: 20px; padding: 5px 16px 0; font-size: 12px; color: var(--success); }
+.inline-status.error { color: var(--danger); }
 
 /* Category tabs — horizontal scroll */
 .category-tabs {
@@ -95,37 +109,27 @@ body {
 .category-tab.active .count-badge { background: rgba(255,255,255,.2); color: rgba(255,255,255,.85); }
 
 /* Table wrapper — horizontal scroll */
-.table-wrapper {
-  overflow-x: auto; -webkit-overflow-scrolling: touch;
-}
+.table-wrapper { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 
 /* Table */
-.facts-table {
-  min-width: 640px;
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13px;
-}
+.facts-table { min-width: 640px; width: 100%; border-collapse: collapse; font-size: 13px; }
 .facts-table thead { position: sticky; top: 0; background: var(--bg); z-index: 1; }
 .facts-table th {
   text-align: left; padding: 11px 12px;
   border-bottom: 2px solid var(--border);
   color: var(--text-muted); font-weight: 600;
   font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
-  cursor: pointer; user-select: none; white-space: nowrap;
+  white-space: nowrap;
 }
-.facts-table th:hover { color: var(--text); }
-.facts-table th .sort-arrow { display: inline-block; margin-left: 4px; font-size: 10px; opacity: .6; }
+.sort-btn { color: inherit; background: transparent; border: 0; cursor: pointer; font: inherit; text-transform: inherit; letter-spacing: inherit; }
+.sort-btn:hover { color: var(--text); }
+.sort-arrow { display: inline-block; margin-left: 4px; font-size: 10px; opacity: .6; }
 .facts-table .td-status { white-space: nowrap; width: 90px; }
-.facts-table td {
-  padding: 11px 12px;
-  border-bottom: 1px solid var(--border);
-  vertical-align: top; line-height: 1.5;
-}
+.facts-table td { padding: 11px 12px; border-bottom: 1px solid var(--border); vertical-align: top; line-height: 1.5; }
 .facts-table tbody tr:active { background: var(--surface); }
 .facts-table .td-cat { white-space: nowrap; color: var(--text-muted); font-size: 11px; width: 100px; }
 .facts-table .td-title { font-weight: 600; color: var(--text); width: 140px; }
-.facts-table .td-detail { color: var(--text-dim); white-space: pre-wrap; word-break: break-word; }
+.facts-table .td-detail { color: var(--text-dim); white-space: pre-wrap; overflow-wrap: anywhere; }
 .fact-update-btn {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 4px 10px; border-radius: 7px; cursor: pointer; font-family: inherit;
@@ -141,16 +145,53 @@ body {
 .empty-state { text-align: center; padding: 60px 24px; color: var(--text-muted); }
 .empty-state h3 { margin: 0 0 8px; color: var(--text); font-size: 16px; }
 .empty-state p { font-size: 13px; }
+.empty-state button { margin-top: 14px; }
+
+/* Fact form modal */
+dialog {
+  width: min(620px, calc(100vw - 24px)); max-height: calc(100vh - 32px); overflow: auto;
+  margin: auto; border: 1px solid var(--border); border-radius: 14px;
+  background: var(--surface); color: var(--text); box-shadow: 0 18px 55px rgba(0,0,0,.35);
+}
+dialog::backdrop { background: rgba(0,0,0,.65); }
+.modal-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 20px; border-bottom: 1px solid var(--border); }
+.modal-header h2 { font-size: 17px; }
+.modal-close { border: 0; background: transparent; color: var(--text-muted); cursor: pointer; font-size: 24px; line-height: 1; }
+.fact-form { padding: 18px 20px 20px; }
+.form-grid { display: grid; grid-template-columns: 1fr 110px; gap: 14px; }
+.form-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.form-field.full { grid-column: 1 / -1; }
+.form-field label { color: var(--text-dim); font-size: 12px; font-weight: 600; }
+.form-field input, .form-field textarea {
+  width: 100%; min-height: 42px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg); color: var(--text); padding: 10px 11px; font: 16px/1.4 inherit; outline: none;
+}
+.form-field textarea { min-height: 150px; resize: vertical; }
+.form-field input:focus, .form-field textarea:focus { border-color: var(--accent); }
+.form-field input:disabled { color: var(--text-muted); }
+.toggle-row { display: flex; align-items: center; gap: 9px; min-height: 42px; }
+.toggle-row input { width: 18px; min-height: 18px; accent-color: var(--accent); }
+.form-help, .form-error { font-size: 12px; }
+.form-help { color: var(--text-muted); }
+.form-error { min-height: 18px; margin-top: 12px; color: var(--danger); }
+.modal-actions { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 8px; }
+.modal-actions-right { display: flex; gap: 8px; margin-left: auto; }
 
 /* Mobile */
 @media (max-width: 640px) {
   .header { flex-direction: column; align-items: stretch; gap: 6px; }
   .header h1 { font-size: 16px; }
   .header .subtitle { font-size: 11px; }
+  .header-actions { justify-content: space-between; }
   .facts-table { font-size: 12px; }
   .facts-table th, .facts-table td { padding: 9px 8px; }
   .facts-table .td-cat { font-size: 11px; width: 80px; }
   .facts-table .td-title { width: 110px; }
+  .form-grid { grid-template-columns: 1fr; }
+  .form-field.full { grid-column: auto; }
+  .modal-actions { align-items: stretch; flex-direction: column-reverse; }
+  .modal-actions-right { width: 100%; margin-left: 0; }
+  .modal-actions button { flex: 1; }
 }
 </style>
 </head>
@@ -161,14 +202,17 @@ body {
     <h1>Meshmesh Facts</h1>
     <div class="subtitle">Catalog of known configs, credentials &amp; workflows</div>
   </div>
-  <a href="/">← Back to Chat</a>
+  <div class="header-actions">
+    <button class="primary-btn" id="add-fact" type="button">Add fact</button>
+    <a href="/">← Back to Chat</a>
+  </div>
 </div>
 
 <div class="search-bar">
-  <input type="text" id="search" placeholder="Search facts…" oninput="renderFacts()" autocomplete="off">
+  <input type="search" id="search" placeholder="Search facts…" autocomplete="off" aria-label="Search facts">
 </div>
-
-<div class="category-tabs" id="tabs"></div>
+<div class="inline-status" id="page-status" role="status" aria-live="polite"></div>
+<div class="category-tabs" id="tabs" aria-label="Fact categories"></div>
 
 <div class="table-wrapper">
   <div id="container" style="padding:20px 16px;">
@@ -176,135 +220,382 @@ body {
   </div>
 </div>
 
+<dialog id="fact-dialog" aria-labelledby="dialog-title">
+  <div class="modal-header">
+    <h2 id="dialog-title">Add fact</h2>
+    <button class="modal-close" id="modal-close" type="button" aria-label="Close">×</button>
+  </div>
+  <form class="fact-form" id="fact-form">
+    <div class="form-grid">
+      <div class="form-field full">
+        <label for="fact-id">ID (lowercase slug)</label>
+        <input id="fact-id" name="id" required pattern="[a-z0-9-]+" placeholder="example-fact">
+        <span class="form-help">The ID cannot be changed after creation.</span>
+      </div>
+      <div class="form-field">
+        <label for="fact-category">Category</label>
+        <input id="fact-category" name="category" required>
+      </div>
+      <div class="form-field">
+        <label for="fact-icon">Icon</label>
+        <input id="fact-icon" name="icon" maxlength="16" placeholder="📋">
+      </div>
+      <div class="form-field full">
+        <label for="fact-title">Title</label>
+        <input id="fact-title" name="title" required>
+      </div>
+      <div class="form-field full">
+        <label for="fact-detail">Details</label>
+        <textarea id="fact-detail" name="detail" required></textarea>
+      </div>
+      <div class="form-field">
+        <label for="fact-hint">Secret hint</label>
+        <input id="fact-hint" name="hint" placeholder="Encrypted — ask Meshmesh">
+      </div>
+      <div class="form-field">
+        <label for="fact-sort-order">Sort order</label>
+        <input id="fact-sort-order" name="sort_order" type="number" step="1" value="0" required>
+      </div>
+      <div class="form-field full">
+        <label class="toggle-row" for="fact-secret">
+          <input id="fact-secret" name="secret" type="checkbox">
+          Hide details behind “🔒 Ask Meshmesh”
+        </label>
+      </div>
+    </div>
+    <div class="form-error" id="form-error" role="alert"></div>
+    <div class="modal-actions">
+      <button class="danger-btn" id="delete-fact" type="button" hidden>Delete</button>
+      <div class="modal-actions-right">
+        <button class="secondary-btn" id="cancel-fact" type="button">Cancel</button>
+        <button class="primary-btn" id="save-fact" type="submit">Save fact</button>
+      </div>
+    </div>
+  </form>
+</dialog>
+
 <script>
-const FACTS = [
-  { id:"moldova-ssh", category:"Server Access", icon:"🖥️", title:"Moldova Server — SSH", detail:"Host: 217.156.8.100\nUser: root (old) / deploy (current)\nPort: 22 (old) / 22666 (current, key auth)\nKey path (Hostinger): /data/.ssh/moldova\nPersistent tunnel via autossh forwarding all arr ports.", secret:false },
-  { id:"moldova-deploy-pass", category:"Server Access", icon:"🔑", title:"Moldova — Deploy Password", detail:"Deploy user password stored in memory recall. Ask Meshmesh: 'moldova deploy user password'.", secret:true, hint:"Encrypted — ask Meshmesh" },
-  { id:"ssh-tunnel", category:"Server Access", icon:"🔗", title:"SSH Tunnel", detail:"ssh -L 7878:127.0.0.1:7878 -L 8989:127.0.0.1:8989 -L 9696:127.0.0.1:9696 -L 8085:127.0.0.1:8085 root@217.156.8.100\n(Use deploy@22666 for new setup)", secret:false },
-  { id:"arrstack-mcp", category:"Server Access", icon:"🔌", title:"Arrstack MCP", detail:"http://217.156.8.100:8000/mcp\nRestricted via UFW source IP + IPv6.", secret:false },
-  { id:"jellyfin", category:"Media Server", icon:"🎬", title:"Jellyfin", detail:"https://jellyfin.abdowahba.me\nAdmin: adminAW", secret:true, hint:"Encrypted — ask Meshmesh" },
-  { id:"radarr", category:"Media Server", icon:"🎥", title:"Radarr / Sonarr / Prowlarr", detail:"All on Moldova (217.156.8.100).\nAPI keys in memory recall.", secret:true, hint:"Encrypted — ask Meshmesh" },
-  { id:"qbit", category:"Media Server", icon:"⬇️", title:"qBittorrent", detail:"Port 8085 via Gluetun VPN.\nHTTPS: https://qbt.abdowahba.me\nUser: admin\nExternal access blocked via iptables.", secret:true, hint:"Encrypted — ask Meshmesh" },
-  { id:"google-accounts", category:"Google Workspace", icon:"📧", title:"Google Account Aliases", detail:"4 accounts (OAuth tokens):\n• abdo — personal\n• pcb — Product Camp Berlin\n• accord — Accord Partners\n• gmail — GMail", secret:false },
-  { id:"coaching-invoices", category:"Google Workspace", icon:"📄", title:"Invoices Folder", detail:"Drive folder: 1JgUOOboLPSDs4eCi86Q-g6iF5FTncDy4\nUse google-workspace-intake skill.", secret:false },
-  { id:"asana", category:"APIs & Services", icon:"📋", title:"Asana", detail:"Personal: me@abdowahba.com\nAccord: abdo@accordpartners.ai\nAPI keys in memory recall.", secret:true, hint:"Encrypted — ask Meshmesh" },
-  { id:"dropbox", category:"APIs & Services", icon:"📦", title:"Dropbox", detail:"Token at dropbox-access-token.txt\nAuto-refresh enabled.\nPreferred: Invoices/YYYY/{Cat}/{Vendor}/", secret:false },
-  { id:"pipedrive", category:"APIs & Services", icon:"💼", title:"Pipedrive CRM", detail:"User ID: 24659421. Company: Self-employed.\nAPI token in memory recall.", secret:true, hint:"Encrypted — ask Meshmesh" },
-  { id:"trello", category:"APIs & Services", icon:"📌", title:"Trello (SessionPlanner)", detail:"Board ID: 69c975eede47a0d0755b7627\nAPI key + token in memory recall.", secret:true, hint:"Encrypted — ask Meshmesh" },
-  { id:"tito", category:"APIs & Services", icon:"🎟️", title:"Tito (AI Camp Berlin)", detail:"abdo@productcampberlin.org\nPassword in memory recall.", secret:true, hint:"Encrypted — ask Meshmesh" },
-  { id:"ticktick", category:"APIs & Services", icon:"✅", title:"TickTick (Maton)", detail:"Skill: skills/ticktick-api-skill/\nMaton API key in memory recall.", secret:true, hint:"Encrypted — ask Meshmesh" },
-  { id:"github", category:"APIs & Services", icon:"🐙", title:"GitHub", detail:"Account: abdelrahmanw (id 32943707)\nPAT token (scope: repo) stored in memory recall.\nAccess via HTTP API: Authorization: token <PAT>\nRepos with PUSH+PULL access (9 total, private unless noted):\n• abdelrahmanw/accord-openclaw-web\n• abdelrahmanw/aicamp-tests\n• abdelrahmanw/bads-ws1718-group-15\n• abdelrahmanw/book-keeping\n• abdelrahmanw/openclaw-web (public)\n• Accord-Partners/accordos_frontend\n• accordsparc/book-keeping\n• dirkbartels14050/PCBsession-2\n• Humboldt-BADS/bads-ws1718-group-15", secret:true, hint:"Encrypted — ask Meshmesh" },
-  { id:"env-keys", category:"APIs & Services", icon:"🔐", title:"Env Var Keys", detail:"OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, GEMINI_API_KEY, OXYLABS_AISTUDIO_API_KEY, OPENCLAW_GATEWAY_TOKEN, MATON_API_KEY", secret:false },
-  { id:"namecheap", category:"APIs & Services", icon:"🌐", title:"Namecheap API", detail:"For DNS on abdowahba.me\nCredentials in memory recall.", secret:true, hint:"Encrypted — ask Meshmesh" },
-  { id:"skills", category:"Config & Skills", icon:"🧰", title:"Available Skills", detail:"1. coaching-invoice-generator\n2. feedback-form-aggregation\n3. google-workspace-intake\n4. meshmesh-market-search\n5. moldova-media-server\n6. oldtimer-deutsche-post-csv\n7. oldtimer-word-workflow\n8. product-feedback-to-sheet-and-trello\nAll in skills/ directory.", secret:false },
-  { id:"model-lock", category:"Config & Skills", icon:"🤖", title:"Model Lock", detail:"Default: DeepSeek Chat (deepseek/deepseek-v4-flash).\nNever switch without Abdo approval.", secret:false },
-  { id:"encoding", category:"Config & Skills", icon:"🔤", title:"Character Encoding", detail:"Always UTF-8. German (ä,ö,ü,ß) and Arabic must display correctly. No encoding artifacts.", secret:false },
-  { id:"subagent", category:"Config & Skills", icon:"🧩", title:"Sub-Agent Strategy", detail:"Spawn for: Google Drive, email, docs, data retrieval, Google Workspace, multi-step, workflows, multi-step skills, anything blocking main session.", secret:false },
-  { id:"backup", category:"Config & Skills", icon:"💾", title:"Backup Schedule", detail:"Tuesdays & Fridays only.\n→ Google Drive 'Meshmesh Backups' folder.\nTimestamps in folder names.", secret:false },
-  { id:"meshmesh-web", category:"Config & Skills", icon:"🌍", title:"Meshmesh Web UI", detail:"https://meshmesh.abdowahba.me\nTraefik + Let's Encrypt on Hostinger.\nPM2: openclaw-web", secret:false },
-  { id:"browser-setup", category:"Config & Skills", icon:"🖥️", title:"Browser Setup", detail:"Xvfb :99, x11vnc 5900, noVNC 6080.\nChromium at DISPLAY=:99", secret:false },
-  { id:"tailscale", category:"Config & Skills", icon:"🔒", title:"Tailscale Sidecar", detail:"meshmesh-hostinger (100.71.162.25).\nSOCKS5 172.18.0.5:1080 → Samsung S9 FE exit node.", secret:false },
-  { id:"tito-sync", category:"Workflows", icon:"🔄", title:"Tito → Sheet Sync", detail:"Trigger: 'tito sync'\nSyncs tickets + discount codes.\nSmart update (bold changed cells).", secret:false },
-  { id:"apartment", category:"Other", icon:"🏠", title:"Berlin Apartment", detail:"Kaiser-Wilhelm-Str. 109 A\nWarm rent: 1,683 EUR (base 1,073+utils 342+elec 96+net 62+buffer 110)\nMax 3yr. Deposit 3,219 EUR. Cost-covering.", secret:false },
-  { id:"audio-transcribe", category:"Other", icon:"🎤", title:"Audio Transcription", detail:"Auto-transcribe Telegram voice notes.\nPrefer DeepSeek. React after transcribing.", secret:false },
-];
-
-const CATEGORIES = [...new Set(FACTS.map(f => f.category))];
-
-// Sorting state: { key: 'category'|'title'|'detail'|'status', dir: 1|-1, null = unsorted }
+let facts = [];
+let activeCategory = 'all';
 let sortState = null;
+let editingId = null;
+let statusTimer = null;
 
-function openFactUpdate(f) {
-  // Build a prompt referencing this specific fact row, hand it to a new chat in the "meshmeshweb" project.
-  const prompt = 'Please look up the recorded fact \u0022' + f.title + '\u0022 (' + f.category + ') in the Meshmesh facts catalog.\n' +
-    'Current recorded details:\n' + f.detail + '\n\n' +
-    'Update the recorded information for this row if it is out of date or incorrect, or help me with my question about this specific row.';
-  const url = '/?newChatInProject=' + encodeURIComponent('Meshmesh Web') + '&prompt=' + encodeURIComponent(prompt);
-  window.open(url, '_blank');
-}
+const elements = {
+  search: document.getElementById('search'),
+  tabs: document.getElementById('tabs'),
+  container: document.getElementById('container'),
+  pageStatus: document.getElementById('page-status'),
+  dialog: document.getElementById('fact-dialog'),
+  form: document.getElementById('fact-form'),
+  formError: document.getElementById('form-error'),
+  save: document.getElementById('save-fact'),
+  delete: document.getElementById('delete-fact'),
+};
 
-function renderFacts() {
-  const q = document.getElementById('search').value.toLowerCase();
-  const active = document.querySelector('.category-tab.active')?.dataset?.cat || 'all';
-  let filtered = FACTS.filter(f =>
-    (!q || f.title.toLowerCase().includes(q) || f.detail.toLowerCase().includes(q) || f.category.toLowerCase().includes(q)) &&
-    (active === 'all' || f.category === active)
-  );
-
-  // Apply sorting
-  if (sortState) {
-    const { key, dir } = sortState;
-    filtered = filtered.slice().sort((a, b) => {
-      let av = a[key], bv = b[key];
-      // Status column sorts by secret (locked last) then by title for stability
-      if (key === 'status') { av = a.secret ? 1 : 0; bv = b.secret ? 1 : 0; }
-      av = (av == null ? '' : String(av)).toLowerCase();
-      bv = (bv == null ? '' : String(bv)).toLowerCase();
-      if (av < bv) return -1 * dir;
-      if (av > bv) return 1 * dir;
-      return 0;
-    });
-  }
-
-  const c = document.getElementById('container');
-  if (!filtered.length) {
-    c.innerHTML = '<div class="empty-state"><h3>No facts found</h3><p>Try a different search or category.</p></div>';
-    return;
-  }
-
-  function arrow(key) {
-    if (!sortState || sortState.key !== key) return '';
-    return '<span class="sort-arrow">' + (sortState.dir === 1 ? '▲' : '▼') + '</span>';
-  }
-
-  let html = '<table class="facts-table"><thead><tr>' +
-    '<th onclick="sortFacts(\'category\')">Category' + arrow('category') + '</th>' +
-    '<th onclick="sortFacts(\'title\')">Title' + arrow('title') + '</th>' +
-    '<th onclick="sortFacts(\'detail\')">Details' + arrow('detail') + '</th>' +
-    '<th onclick="sortFacts(\'status\')">Status' + arrow('status') + '</th>' +
-    '</tr></thead><tbody>';
-  for (const f of filtered) {
-    const d = f.detail.replace(/\n/g, '<br>');
-    const statusHTML = f.secret ? '<span class="secret-placeholder">🔒 Ask Meshmesh</span>' : '<span style="color:var(--success)">✓</span>';
-    const s = '<span class="fact-status-inline">' + statusHTML +
-      '<button class="fact-update-btn" onclick="openFactUpdate(FACTS.find(x=>x.id===\'' + f.id + '\'))" title="Ask to update this fact">✎ Update</button></span>';
-    html += `<tr><td class="td-cat">${f.icon||''} ${f.category}</td><td class="td-title">${f.title}</td><td class="td-detail">${d}</td><td class="td-status">${s}</td></tr>`;
-  }
-  html += '</tbody></table>';
-  c.innerHTML = html;
-}
-
-function sortFacts(key) {
-  if (sortState && sortState.key === key) {
-    sortState.dir = sortState.dir === 1 ? -1 : 1; // toggle asc/desc
-  } else {
-    sortState = { key, dir: 1 };
-  }
-  renderFacts();
-}
-
-function renderTabs() {
-  let html = '<div class="category-tab active" data-cat="all" onclick="setCategory(\'all\')">All <span class="count-badge">'+FACTS.length+'</span></div>';
-  for (const cat of CATEGORIES) {
-    const n = FACTS.filter(f=>f.category===cat).length;
-    html += '<div class="category-tab" data-cat="'+cat+'" onclick="setCategory(\''+cat.replace(/'/g,"\\'")+'\')">'+cat+' <span class="count-badge">'+n+'</span></div>';
-  }
-  document.getElementById('tabs').innerHTML = html;
-}
-
-// Sync theme with meshmesh-web
-(function() {
+// Sync theme with meshmesh-web.
+(function syncTheme() {
   const saved = localStorage.getItem('openclaw-theme');
   if (saved === 'light') document.documentElement.classList.add('light');
 })();
 
-function setCategory(cat) {
-  document.querySelectorAll('.category-tab').forEach(t => t.classList.toggle('active', t.dataset.cat === cat));
+async function apiFetch(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+  });
+  if (response.status === 401) {
+    window.location.assign('/');
+    throw new Error('Your session expired. Sign in again.');
+  }
+  if (!response.ok) {
+    let error = `Request failed (${response.status})`;
+    try { error = (await response.json()).error || error; } catch (_) {}
+    throw new Error(error);
+  }
+  if (response.status === 204) return null;
+  return response.json();
+}
+
+function showStatus(message, isError = false) {
+  clearTimeout(statusTimer);
+  elements.pageStatus.textContent = message;
+  elements.pageStatus.classList.toggle('error', isError);
+  if (!isError) statusTimer = setTimeout(() => { elements.pageStatus.textContent = ''; }, 3500);
+}
+
+async function loadFacts({ announce } = {}) {
+  try {
+    facts = await apiFetch('/api/facts');
+    const categories = new Set(facts.map((fact) => fact.category));
+    if (activeCategory !== 'all' && !categories.has(activeCategory)) activeCategory = 'all';
+    renderTabs();
+    renderFacts();
+    if (announce) showStatus(announce);
+  } catch (error) {
+    elements.container.replaceChildren(createEmptyState('Couldn’t load facts', error.message, 'Try again'));
+    elements.container.querySelector('button')?.addEventListener('click', () => loadFacts());
+    showStatus(error.message, true);
+  }
+}
+
+function createEmptyState(title, message, actionLabel) {
+  const empty = document.createElement('div');
+  empty.className = 'empty-state';
+  const heading = document.createElement('h3');
+  heading.textContent = title;
+  const text = document.createElement('p');
+  text.textContent = message;
+  empty.append(heading, text);
+  if (actionLabel) {
+    const button = document.createElement('button');
+    button.className = 'secondary-btn';
+    button.type = 'button';
+    button.textContent = actionLabel;
+    empty.append(button);
+  }
+  return empty;
+}
+
+function renderTabs() {
+  const categories = [...new Set(facts.map((fact) => fact.category))];
+  elements.tabs.replaceChildren();
+  for (const category of ['all', ...categories]) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `category-tab${activeCategory === category ? ' active' : ''}`;
+    button.dataset.cat = category;
+    button.setAttribute('aria-pressed', String(activeCategory === category));
+    button.append(document.createTextNode(category === 'all' ? 'All ' : `${category} `));
+    const count = document.createElement('span');
+    count.className = 'count-badge';
+    count.textContent = category === 'all' ? facts.length : facts.filter((fact) => fact.category === category).length;
+    button.append(count);
+    button.addEventListener('click', () => {
+      activeCategory = category;
+      renderTabs();
+      renderFacts();
+    });
+    elements.tabs.append(button);
+  }
+}
+
+function filteredFacts() {
+  const query = elements.search.value.trim().toLocaleLowerCase();
+  let rows = facts.filter((fact) => {
+    const matchesSearch = !query || [fact.title, fact.detail, fact.category, fact.hint || '']
+      .some((value) => value.toLocaleLowerCase().includes(query));
+    return matchesSearch && (activeCategory === 'all' || fact.category === activeCategory);
+  });
+  if (!sortState) return rows;
+  const { key, dir } = sortState;
+  return rows.slice().sort((a, b) => {
+    const first = key === 'status' ? Number(a.secret) : String(a[key] ?? '').toLocaleLowerCase();
+    const second = key === 'status' ? Number(b.secret) : String(b[key] ?? '').toLocaleLowerCase();
+    const compared = typeof first === 'number' ? first - second : first.localeCompare(second);
+    return (compared || a.id.localeCompare(b.id)) * dir;
+  });
+}
+
+function sortFacts(key) {
+  sortState = sortState?.key === key ? { key, dir: sortState.dir * -1 } : { key, dir: 1 };
   renderFacts();
 }
 
-renderTabs();
-renderFacts();
+function createSortHeader(label, key) {
+  const th = document.createElement('th');
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'sort-btn';
+  button.textContent = label;
+  button.addEventListener('click', () => sortFacts(key));
+  if (sortState?.key === key) {
+    th.setAttribute('aria-sort', sortState.dir === 1 ? 'ascending' : 'descending');
+    const arrow = document.createElement('span');
+    arrow.className = 'sort-arrow';
+    arrow.textContent = sortState.dir === 1 ? '▲' : '▼';
+    arrow.setAttribute('aria-hidden', 'true');
+    button.append(arrow);
+  } else {
+    th.setAttribute('aria-sort', 'none');
+  }
+  th.append(button);
+  return th;
+}
+
+function renderFacts() {
+  const rows = filteredFacts();
+  if (!rows.length) {
+    const hasFilters = elements.search.value.trim() || activeCategory !== 'all';
+    elements.container.replaceChildren(createEmptyState(
+      'No facts found',
+      hasFilters ? 'Try a different search or category.' : 'Add the first fact to this catalog.',
+      hasFilters ? null : 'Add fact'
+    ));
+    elements.container.querySelector('button')?.addEventListener('click', openAddDialog);
+    return;
+  }
+
+  const table = document.createElement('table');
+  table.className = 'facts-table';
+  const thead = document.createElement('thead');
+  const headerRow = document.createElement('tr');
+  headerRow.append(
+    createSortHeader('Category', 'category'),
+    createSortHeader('Title', 'title'),
+    createSortHeader('Details', 'detail'),
+    createSortHeader('Status', 'status')
+  );
+  thead.append(headerRow);
+  const tbody = document.createElement('tbody');
+
+  for (const fact of rows) {
+    const row = document.createElement('tr');
+    const category = document.createElement('td');
+    category.className = 'td-cat';
+    category.textContent = `${fact.icon || ''}${fact.icon ? ' ' : ''}${fact.category}`;
+    const title = document.createElement('td');
+    title.className = 'td-title';
+    title.textContent = fact.title;
+    const detail = document.createElement('td');
+    detail.className = 'td-detail';
+    if (fact.secret) {
+      const secret = document.createElement('span');
+      secret.className = 'secret-placeholder';
+      secret.textContent = `🔒 Ask Meshmesh${fact.hint ? ` — ${fact.hint}` : ''}`;
+      detail.append(secret);
+    } else {
+      detail.textContent = fact.detail;
+    }
+    const status = document.createElement('td');
+    status.className = 'td-status';
+    const statusInline = document.createElement('span');
+    statusInline.className = 'fact-status-inline';
+    const marker = document.createElement('span');
+    marker.className = fact.secret ? 'secret-placeholder' : '';
+    marker.style.color = fact.secret ? '' : 'var(--success)';
+    marker.textContent = fact.secret ? '🔒 Ask Meshmesh' : '✓';
+    const edit = document.createElement('button');
+    edit.type = 'button';
+    edit.className = 'fact-update-btn';
+    edit.textContent = 'Edit';
+    edit.setAttribute('aria-label', `Edit ${fact.title}`);
+    edit.addEventListener('click', () => openEditDialog(fact));
+    statusInline.append(marker, edit);
+    status.append(statusInline);
+    row.append(category, title, detail, status);
+    tbody.append(row);
+  }
+  table.append(thead, tbody);
+  elements.container.replaceChildren(table);
+}
+
+function resetFormState() {
+  elements.form.reset();
+  elements.formError.textContent = '';
+  elements.save.disabled = false;
+  elements.delete.disabled = false;
+  elements.save.textContent = 'Save fact';
+}
+
+function openAddDialog() {
+  editingId = null;
+  resetFormState();
+  document.getElementById('dialog-title').textContent = 'Add fact';
+  document.getElementById('fact-id').disabled = false;
+  document.getElementById('fact-sort-order').value = facts.length ? Math.max(...facts.map((fact) => fact.sort_order)) + 1 : 0;
+  elements.delete.hidden = true;
+  elements.dialog.showModal();
+  document.getElementById('fact-id').focus();
+}
+
+function openEditDialog(fact) {
+  editingId = fact.id;
+  resetFormState();
+  document.getElementById('dialog-title').textContent = 'Edit fact';
+  document.getElementById('fact-id').value = fact.id;
+  document.getElementById('fact-id').disabled = true;
+  document.getElementById('fact-category').value = fact.category;
+  document.getElementById('fact-icon').value = fact.icon || '';
+  document.getElementById('fact-title').value = fact.title;
+  document.getElementById('fact-detail').value = fact.detail;
+  document.getElementById('fact-secret').checked = fact.secret;
+  document.getElementById('fact-hint').value = fact.hint || '';
+  document.getElementById('fact-sort-order').value = fact.sort_order;
+  elements.delete.hidden = false;
+  elements.dialog.showModal();
+  document.getElementById('fact-category').focus();
+}
+
+function closeDialog() {
+  if (!elements.save.disabled) elements.dialog.close();
+}
+
+function formPayload() {
+  return {
+    id: document.getElementById('fact-id').value.trim(),
+    category: document.getElementById('fact-category').value.trim(),
+    icon: document.getElementById('fact-icon').value.trim() || null,
+    title: document.getElementById('fact-title').value.trim(),
+    detail: document.getElementById('fact-detail').value.trim(),
+    secret: document.getElementById('fact-secret').checked,
+    hint: document.getElementById('fact-hint').value.trim() || null,
+    sort_order: Number(document.getElementById('fact-sort-order').value),
+  };
+}
+
+function setFormBusy(busy, label) {
+  elements.save.disabled = busy;
+  elements.delete.disabled = busy;
+  elements.save.textContent = busy ? label : 'Save fact';
+}
+
+elements.form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!elements.form.reportValidity()) return;
+  setFormBusy(true, 'Saving…');
+  elements.formError.textContent = '';
+  try {
+    const payload = formPayload();
+    if (editingId) delete payload.id;
+    await apiFetch(editingId ? `/api/facts/${encodeURIComponent(editingId)}` : '/api/facts', {
+      method: editingId ? 'PUT' : 'POST',
+      body: JSON.stringify(payload),
+    });
+    elements.dialog.close();
+    await loadFacts({ announce: editingId ? 'Fact updated.' : 'Fact added.' });
+  } catch (error) {
+    elements.formError.textContent = error.message;
+  } finally {
+    setFormBusy(false);
+  }
+});
+
+elements.delete.addEventListener('click', async () => {
+  const fact = facts.find((item) => item.id === editingId);
+  if (!fact || !window.confirm(`Delete “${fact.title}”? This cannot be undone.`)) return;
+  setFormBusy(true, 'Deleting…');
+  elements.formError.textContent = '';
+  try {
+    await apiFetch(`/api/facts/${encodeURIComponent(editingId)}`, { method: 'DELETE' });
+    elements.dialog.close();
+    await loadFacts({ announce: 'Fact deleted.' });
+  } catch (error) {
+    elements.formError.textContent = error.message;
+  } finally {
+    setFormBusy(false);
+  }
+});
+
+elements.search.addEventListener('input', renderFacts);
+document.getElementById('add-fact').addEventListener('click', openAddDialog);
+document.getElementById('modal-close').addEventListener('click', closeDialog);
+document.getElementById('cancel-fact').addEventListener('click', closeDialog);
+elements.dialog.addEventListener('click', (event) => {
+  if (event.target === elements.dialog) closeDialog();
+});
+
+loadFacts();
 </script>
 </body>
 </html>

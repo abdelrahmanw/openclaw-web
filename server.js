@@ -172,6 +172,7 @@ function drainQueue(chatId) {
 
 const db = require('./db');
 const { createGatewayClient } = require('./gateway-client');
+const { createFactsRouter } = require('./facts-api');
 const sqlite3 = require('sqlite3');
 
 // ============================================================
@@ -511,6 +512,33 @@ app.use('/api/shares', requireAuth);
 app.use('/api/transcribe', requireAuth);
 app.use('/api/download', requireAuth);
 app.use('/api/settings', requireAuth);
+app.use('/api/facts', requireAuth);
+
+async function notifyAgentOfFactMutation(action, fact) {
+  const client = gatewayClient && gatewayClient.connected ? gatewayClient : createGatewayClient();
+  const oneShot = client !== gatewayClient;
+  const safeFact = {
+    id: fact.id,
+    category: fact.category,
+    icon: fact.icon,
+    title: fact.title,
+    secret: fact.secret,
+    sort_order: fact.sort_order,
+    ...(fact.secret ? { detail: '[secret detail omitted]' } : { detail: fact.detail, hint: fact.hint }),
+  };
+  try {
+    await client.request('chat.send', {
+      sessionKey: process.env.FACTS_AGENT_SESSION_KEY || 'agent:main:main',
+      message: `[Facts catalog mutation]\nA fact was ${action} through the authenticated /facts UI. Reconcile the catalog with TOOLS.md and MEMORY.md where appropriate. Do not copy secret values into less-protected notes.\n${JSON.stringify(safeFact, null, 2)}`,
+      idempotencyKey: `facts-${action}-${fact.id}-${uuidv4()}`,
+      timeoutMs: 600000,
+    });
+  } finally {
+    if (oneShot) client.close();
+  }
+}
+
+app.use('/api/facts', createFactsRouter({ db, notifyMutation: notifyAgentOfFactMutation }));
 
 // --- Projects ---
 app.get('/api/projects', async (req, res) => {
