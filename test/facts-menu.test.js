@@ -24,11 +24,11 @@ describe('Facts Tools menu item', function () {
     assert.strictEqual(factsItems[0].nextElementSibling, firstDivider);
   });
 
-  it('closes the Tools menu and navigates to /facts', function () {
+  it('opens /facts in a new tab with noopener, then closes the Tools menu', function () {
     const factsItem = toolsMenu.querySelector('#tools-facts-btn');
     assert.strictEqual(
       factsItem.getAttribute('onclick'),
-      "closeToolsMenu(); window.location.href='/facts'"
+      "window.open('/facts', '_blank', 'noopener'); closeToolsMenu()"
     );
   });
 });

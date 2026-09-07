@@ -102,7 +102,7 @@
             <button class="tools-menu-item" onclick="toggleWorkflowsPanel(); closeToolsMenu()" id="workflows-toggle-btn">Workflows</button>
             <button class="tools-menu-item" onclick="toggleSkillsPanel(); closeToolsMenu()" id="skills-toggle-btn">Skills</button>
             <button class="tools-menu-item" onclick="toggleCorePanel(); closeToolsMenu()" id="core-toggle-btn">Core</button>
-            <button class="tools-menu-item" id="tools-facts-btn" onclick="closeToolsMenu(); window.location.href='/facts'">Facts</button>
+            <button class="tools-menu-item" id="tools-facts-btn" onclick="window.open('/facts', '_blank', 'noopener'); closeToolsMenu()">Facts</button>
             <hr class="tools-menu-divider"/>
             <button class="tools-menu-item" id="tools-read-chat-btn" onclick="readChatTranscript(); closeToolsMenu()">Read Chat</button>
             <button class="tools-menu-item" id="tools-summarize-chat-btn" onclick="summarizeChatTranscript(); closeToolsMenu()">Read &amp; summarize</button>

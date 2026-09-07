@@ -4,6 +4,19 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, shrink-to-fit=no">
 <title>Facts · Meshmesh</title>
+<script>
+(function syncFactsTheme() {
+  const themeStorageKey = 'openclaw-theme';
+  const applyStoredTheme = (value) => {
+    document.documentElement.classList.toggle('light', value === 'light');
+  };
+
+  applyStoredTheme(localStorage.getItem(themeStorageKey));
+  window.addEventListener('storage', (event) => {
+    if (event.key === themeStorageKey) applyStoredTheme(event.newValue);
+  });
+})();
+</script>
 <style>
 :root { color-scheme: dark; }
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -292,12 +305,6 @@ const elements = {
   save: document.getElementById('save-fact'),
   delete: document.getElementById('delete-fact'),
 };
-
-// Sync theme with meshmesh-web.
-(function syncTheme() {
-  const saved = localStorage.getItem('openclaw-theme');
-  if (saved === 'light') document.documentElement.classList.add('light');
-})();
 
 async function apiFetch(url, options = {}) {
   const response = await fetch(url, {
