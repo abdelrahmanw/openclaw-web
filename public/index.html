@@ -107,7 +107,7 @@
             <button class="tools-menu-item" id="tools-summarize-chat-btn" onclick="summarizeChatTranscript(); closeToolsMenu()">Read &amp; summarize</button>
             <hr class="tools-menu-divider"/>
             <button class="tools-menu-item" onclick="renameAllChats(); closeToolsMenu()" id="rename-all-btn">✨ Rename All</button>
-            <button class="tools-menu-item" onclick="window.open('/facts','_blank'); closeToolsMenu()">📋 Facts</button>
+            <button class="tools-menu-item" id="tools-facts-btn" onclick="closeToolsMenu(); window.location.href='/facts'">Facts</button>
             <button class="tools-menu-item" onclick="toggleTheme(); closeToolsMenu()" id="theme-toggle-btn">🌙 Theme</button>
           </div>
         </div>
