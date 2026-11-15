@@ -2173,3 +2173,30 @@ mark.search-highlight {
   50% { transform: scale(1.3); }
   100% { transform: scale(1); }
 }
+
+/* === URL-integrity warning banner (shortened pastes / OAuth codes) === */
+.url-warning-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 8px 12px;
+  background: var(--surface2);
+  border: 1px solid var(--warning, #d9822b);
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+}
+.url-warning-banner span { flex: 1; min-width: 0; }
+.url-warning-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+.url-warning-close:hover { color: var(--text); }

@@ -1183,7 +1183,7 @@ function renderMessage(msg, staleThinkingIds) {
       content = `<div class="message-bubble thinking-stale"><span style="opacity:0.5">⚠️</span> <span style="opacity:0.7;font-size:13px">Response was lost. Please try again.</span></div>`;
     }
   } else {
-    const rendered = isUser ? esc(msg.content).replace(/\n/g, '<br>') : renderMarkdown(msg.content);
+    const rendered = isUser ? linkifyShortenedUrls(esc(msg.content)).replace(/\n/g, '<br>') : renderMarkdown(msg.content);
     const dirAttr = getTextDirection(msg.content) === 'rtl' ? ' dir="rtl"' : '';
     content = `<div class="message-bubble"${dirAttr}>${rendered}</div>`;
   }
@@ -1270,6 +1270,23 @@ function refreshArtifactPanelIfOpen() {
 }
 
 // === Send message ===
+function truncateUrlMiddle(url, head = 44, tail = 6) {
+  if (!url || url.length <= head + tail + 1) return url;
+  return url.slice(0, head) + '…' + url.slice(-tail);
+}
+
+// Bare URLs are rendered as "shortened display + full raw", so long auth/paste
+// links (OAuth localhost redirects with ~90-char codes) are never displayed
+// truncated without a way to recover the full string.
+function linkifyShortenedUrls(text) {
+  const urlRe = /https?:\/\/[^\s<>"']+/g;
+  return text.replace(urlRe, (url) => {
+    if (url.length <= 60) return url;
+    const shown = truncateUrlMiddle(url);
+    return `<a href="${esc(url)}" target="_blank" rel="noopener" title="${esc(url)}">${esc(shown)}</a>`;
+  });
+}
+
 async function sendMessage() {
   const input = document.getElementById('msg-input');
   const text = input.value.trim();
@@ -1318,7 +1335,23 @@ async function sendMessage() {
   }
 
   btn.disabled = false;
+  if (res && res.urlWarning) showUrlWarning(res.urlWarning);
   startLegacyPoll(chatId, res.aiMsgId);
+}
+
+// Persistent banner: the last sent message contained a link that looks
+// shortened by a chat surface (middle-ellipsis), which would break OAuth codes.
+function showUrlWarning() {
+  let el = document.getElementById('url-warning-banner');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'url-warning-banner';
+    el.className = 'url-warning-banner';
+    const wrap = document.querySelector('.input-wrap');
+    if (!wrap) return;
+    wrap.insertBefore(el, wrap.firstChild);
+  }
+  el.innerHTML = `<span>⚠️ That message contained a link with a middle-ellipsis (…). Chat surfaces can shorten long pastes — if this is an OAuth code, send <b>EXPAND</b> and I will expand it, or re-paste from the address bar.</span><button class="url-warning-close" onclick="document.getElementById('url-warning-banner')?.remove()">×</button>`;
 }
 
 // Shared completion handler — idempotent, called by SSE or poll, whichever fires first.
@@ -2382,46 +2415,67 @@ async function deleteProjectLink(projectId, linkId) {
   if (project) await renderProjectPage(project);
 }
 
+// Move-to-project picker: searchable + alphabetical.
+// `state._moveProject` holds the current chat/selection while the modal is open.
+function moveProjectOptionHTML(p, selected) {
+  return `<div class="move-project-option" data-name="${esc((p.name || '').toLowerCase())}" onclick="selectMoveProject('${p.id}',this)" data-id="${p.id}" style="padding:10px 12px;border-radius:8px;cursor:pointer;border:2px solid ${selected?'var(--accent)':'var(--border)'};background:${selected?'var(--surface2)':'transparent'};margin-bottom:6px;display:flex;align-items:center;gap:8px">
+      <span>📁</span> ${esc(p.name)}
+    </div>`;
+}
+
+function renderMoveProjectList() {
+  const list = document.getElementById('move-project-list');
+  if (!list) return;
+  const sel = state._moveProject || {};
+  const q = (document.getElementById('move-project-search')?.value || '').trim().toLowerCase();
+  const sorted = [...state.projects].sort((a, b) =>
+    (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base', numeric: true })
+  );
+  const noProjectHTML = `<div class="move-project-option" data-name="no project" onclick="selectMoveProject(null,this)" data-id="" style="padding:10px 12px;border-radius:8px;cursor:pointer;border:2px solid ${!sel.chatProjectId?'var(--accent)':'var(--border)'};background:${!sel.chatProjectId?'var(--surface2)':'transparent'};margin-bottom:6px;display:flex;align-items:center;gap:8px">
+        <span>🚫</span> No Project
+      </div>`;
+  const matches = sorted.filter(p => !q || (p.name || '').toLowerCase().includes(q));
+  const showNoProject = !q || 'no project'.includes(q) || q.includes('no project');
+  let html = showNoProject ? noProjectHTML : '';
+  html += matches.map(p => moveProjectOptionHTML(p, sel.chatProjectId === p.id)).join('');
+  if (!html) html = `<div style="padding:12px;color:var(--text-muted);font-size:13px;text-align:center">No projects match "${esc(q)}"</div>`;
+  list.innerHTML = html;
+}
+
 async function moveChatToProject(chatId) {
   const chat = state.chats.find(c => c.id === chatId);
   if (!chat) return;
-  const optionsHTML = state.projects.map(p =>
-    `<div class="move-project-option" onclick="selectMoveProject('${p.id}',this)" data-id="${p.id}" style="padding:10px 12px;border-radius:8px;cursor:pointer;border:2px solid ${chat.project_id===p.id?'var(--accent)':'var(--border)'};background:${chat.project_id===p.id?'var(--surface2)':'transparent'};margin-bottom:6px;display:flex;align-items:center;gap:8px">
-      <span>📁</span> ${esc(p.name)}
-    </div>`
-  ).join('');
+  state._moveProject = { chatId, chatProjectId: chat.project_id || null, selectedId: chat.project_id || null };
   showModal(`<h3>Move Chat to Project</h3>
-    <p style="font-size:13px;color:var(--text-muted);margin-bottom:12px">Select a project for "${esc(chat.title)}"</p>
-    <div id="move-project-list">
-      <div class="move-project-option" onclick="selectMoveProject(null,this)" data-id="" style="padding:10px 12px;border-radius:8px;cursor:pointer;border:2px solid ${!chat.project_id?'var(--accent)':'var(--border)'};background:${!chat.project_id?'var(--surface2)':'transparent'};margin-bottom:6px;display:flex;align-items:center;gap:8px">
-        <span>🚫</span> No Project
-      </div>
-      ${optionsHTML}
-    </div>
+    <p style="font-size:13px;color:var(--text-muted);margin-bottom:8px">Select a project for "${esc(chat.title)}"</p>
+    <input class="modal-input" id="move-project-search" placeholder="Search projects…" autocomplete="off" oninput="renderMoveProjectList()" onkeydown="if(event.key==='Enter'){event.preventDefault();confirmMoveChat('${chatId}')}if(event.key==='Escape'){closeModal()}"/>
+    <div id="move-project-list" style="max-height:45vh;overflow-y:auto;margin-top:8px"></div>
     <div style="margin-top:4px;font-size:12px;color:var(--text-muted)">Currently in: ${chat.project_id ? esc(state.projects.find(p=>p.id===chat.project_id)?.name||'Unknown') : 'No project'}</div>
     <div class="modal-actions" style="margin-top:16px">
       <button class="modal-btn secondary" onclick="closeModal()">Cancel</button>
       <button class="modal-btn primary" onclick="confirmMoveChat('${chatId}')">Move</button>
     </div>`);
-  // Store selected project id on the list
-  const list = document.getElementById('move-project-list');
-  list.dataset.selectedId = chat.project_id || '';
+  renderMoveProjectList();
+  const search = document.getElementById('move-project-search');
+  if (search) search.focus();
 }
 
 function selectMoveProject(projectId, el) {
   const list = document.getElementById('move-project-list');
+  if (!list) return;
   list.querySelectorAll('.move-project-option').forEach(opt => {
     opt.style.borderColor = 'var(--border)';
     opt.style.background = 'transparent';
   });
   el.style.borderColor = 'var(--accent)';
   el.style.background = 'var(--surface2)';
+  if (!state._moveProject) state._moveProject = {};
+  state._moveProject.selectedId = projectId || null;
   list.dataset.selectedId = projectId || '';
 }
 
 async function confirmMoveChat(chatId) {
-  const list = document.getElementById('move-project-list');
-  const projectId = list.dataset.selectedId || null;
+  const projectId = (state._moveProject && state._moveProject.selectedId) || null;
   const chat = state.chats.find(c => c.id === chatId);
   if (!chat) return;
   const updated = await api(`/api/chats/${chatId}`, 'PUT', {
@@ -2468,7 +2522,7 @@ async function renameChat(id) {
   const chat = state.chats.find(c => c.id === id);
   if (!chat) return;
   showModal(`<h3>Rename Chat</h3>
-    <input class="modal-input" id="m-title" value="${esc(chat.title)}" autofocus/>
+    <input class="modal-input" id="m-title" value="${esc(chat.title)}" autofocus onkeydown="if(event.key==='Enter'){event.preventDefault();saveChatTitle('${id}')}else if(event.key==='Escape'){event.preventDefault();closeModal()}"/>
     <div class="modal-actions">
       <button class="modal-btn secondary" onclick="closeModal()">Cancel</button>
       <button class="modal-btn primary" onclick="saveChatTitle('${id}')">Save</button>
@@ -2627,6 +2681,7 @@ function showModal(html) {
 
 function closeModal() {
   document.getElementById('modal-overlay').style.display = 'none';
+  state._moveProject = null;
 }
 
 // === Helpers ===
@@ -3974,6 +4029,36 @@ async function _fetchAndSendTranscript(action) {
     if (readBtn) readBtn.style.opacity = '';
     if (summarizeBtn) summarizeBtn.style.opacity = '';
   }
+}
+
+// === Copy Chat: copy the full transcript (both roles) to the clipboard ===
+async function copyChat() {
+  if (!state.currentChat) {
+    showCompletionToast('Open a chat first');
+    return;
+  }
+  const chatId = state.currentChat.id;
+  try {
+    const data = await api(`/api/chats/${chatId}/transcript?action=copy`);
+    if (!data.transcript || !data.messageCount) {
+      showCompletionToast('No messages in this chat yet');
+      return;
+    }
+    await navigator.clipboard.writeText(data.transcript);
+    showCompletionToast(`Copied chat transcript (${data.messageCount} messages)`);
+  } catch (e) {
+    showCompletionToast('Copy error: ' + e.message);
+  }
+}
+
+// === Get Transcript: open the raw transcript in a new tab as plain text ===
+async function getTranscript() {
+  if (!state.currentChat) {
+    showCompletionToast('Open a chat first');
+    return;
+  }
+  const chatId = state.currentChat.id;
+  window.open(`/api/chats/${chatId}/transcript.txt`, '_blank');
 }
 
 function activateLastUserMessageEdit() {
