@@ -2070,13 +2070,14 @@ async function renderProjectPage(project) {
 
   const isAdminOrAccord = window.currentUser?.role === 'admin' || window.currentUser?.role === 'accord';
 
-  // Load files, links, chats (and members for admin/accord) in parallel
-  let files = [], links = [], chats = [], members = [], allUsers = [];
+  // Load files, links, artifacts, chats (and members for admin/accord) in parallel
+  let files = [], links = [], artifacts = [], chats = [], members = [], allUsers = [];
   try {
     const base = [
       api(`/api/projects/${project.id}/files`),
       api(`/api/projects/${project.id}/links`),
       api(`/api/chats?project_id=${project.id}`),
+      api(`/api/projects/${project.id}/artifacts`).catch(() => []),
     ];
     if (isAdminOrAccord) {
       base.push(api(`/api/projects/${project.id}/members`));
@@ -2084,14 +2085,15 @@ async function renderProjectPage(project) {
     }
     const results = await Promise.all(base);
     [files, links, chats] = results;
-    if (isAdminOrAccord) { members = results[3]; allUsers = results[4]; }
+    artifacts = Array.isArray(results[3]) ? results[3] : [];
+    if (isAdminOrAccord) { members = results[4]; allUsers = results[5]; }
   } catch (e) {
     area.innerHTML = `<div class="project-page"><p style="color:var(--danger)">Failed to load project: ${esc(e.message)}</p></div>`;
     return;
   }
 
-  const LINK_ICONS = { doc: '📝', sheet: '📊', slide: '📑', folder: '📁' };
-  const LINK_LABELS = { doc: 'Google Doc', sheet: 'Google Sheet', slide: 'Google Slides', folder: 'Drive Folder' };
+  const LINK_ICONS = { doc: '📝', sheet: '📊', slide: '📑', folder: '📁', artifact: '📦' };
+  const LINK_LABELS = { doc: 'Google Doc', sheet: 'Google Sheet', slide: 'Google Slides', folder: 'Drive Folder', artifact: 'Artifact' };
 
   const filesHTML = files.map(f => {
     const size = f.size > 1024 * 1024
@@ -2113,6 +2115,24 @@ async function renderProjectPage(project) {
       <a class="project-file-name project-link-name" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.title)}</a>
       <span class="project-file-size" style="color:var(--text-muted)">${label}</span>
       <button class="action-btn" onclick="deleteProjectLink('${project.id}','${l.id}')" title="Remove">🗑</button>
+    </div>`;
+  }).join('');
+
+  const ART_ICONS = { '.html': '🌐', '.htm': '🌐', '.pdf': '📕', '.csv': '📊', '.json': '{}', '.md': '📄', '.txt': '📄', '.png': '🖼', '.jpg': '🖼', '.jpeg': '🖼', '.svg': '🖼', '.webp': '🖼' };
+  const artExt = (n) => { const m = String(n || '').match(/(\.[A-Za-z0-9]+)$/); return m ? m[1].toLowerCase() : ''; };
+  const artifactsHTML = artifacts.map(a => {
+    const size = a.size > 1024 * 1024
+      ? (a.size / 1024 / 1024).toFixed(1) + ' MB'
+      : Math.round((a.size || 0) / 1024) + ' KB';
+    const ext = artExt(a.name);
+    const isHtml = ext === '.html' || ext === '.htm';
+    const url = `/p/${encodeURIComponent(project.id)}/artifacts/${encodeURIComponent(a.id)}${isHtml ? '' : '?download=1'}`;
+    return `<div class="project-file-item" data-id="${a.id}">
+      <span class="project-file-icon">${ART_ICONS[ext] || '📦'}</span>
+      <a class="project-file-name project-link-name" href="${url}" ${isHtml ? 'target="_blank" rel="noopener"' : ''}>${esc(a.title || a.name)}</a>
+      <span class="project-file-size" style="color:var(--text-muted)">${ext.replace('.', '').toUpperCase() || 'FILE'} · ${size}</span>
+      ${a.chat_id ? `<button class="action-btn" onclick="openChat('${a.chat_id}')" title="From chat">💬</button>` : ''}
+      <button class="action-btn" onclick="deleteProjectArtifact('${project.id}','${a.id}')" title="Remove">🗑</button>
     </div>`;
   }).join('');
 
@@ -2146,6 +2166,16 @@ async function renderProjectPage(project) {
         </div>
         <div class="project-files-list" id="proj-links-${project.id}">
           ${linksHTML || '<div class="project-files-empty">No links yet</div>'}
+        </div>
+      </div>
+
+      <div class="project-page-section">
+        <div class="project-section-title" style="display:flex;align-items:center;justify-content:space-between">
+          <span>Artifacts <span style="color:var(--text-muted);font-size:12px;font-weight:400">(published pages, reports and exports)</span></span>
+          <a class="modal-btn secondary" style="font-size:12px;padding:5px 10px;text-decoration:none" href="/p/${encodeURIComponent(project.id)}/artifacts" target="_blank" rel="noopener">Open all ↗</a>
+        </div>
+        <div class="project-files-list" id="proj-artifacts-${project.id}">
+          ${artifactsHTML || '<div class="project-files-empty">No artifacts yet</div>'}
         </div>
       </div>
 
@@ -2411,6 +2441,18 @@ async function addProjectLink(projectId) {
 async function deleteProjectLink(projectId, linkId) {
   if (!confirm('Remove this link from the project?')) return;
   await api(`/api/projects/${projectId}/links/${linkId}`, 'DELETE');
+  const project = state.projects.find(p => p.id === projectId);
+  if (project) await renderProjectPage(project);
+}
+
+async function deleteProjectArtifact(projectId, artifactId) {
+  if (!confirm('Delete this artifact? The file and its link will be removed.')) return;
+  try {
+    await api(`/api/projects/${projectId}/artifacts/${artifactId}`, 'DELETE');
+  } catch (e) {
+    alert('Failed to delete artifact: ' + e.message);
+    return;
+  }
   const project = state.projects.find(p => p.id === projectId);
   if (project) await renderProjectPage(project);
 }
