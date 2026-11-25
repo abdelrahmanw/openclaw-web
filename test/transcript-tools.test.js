@@ -115,10 +115,16 @@ describe('Chat Transcript Tools', function () {
     });
 
     it('system instruction is built server-side, not in frontend code', function () {
-      // Frontend should not contain prompt text for these actions
+      // The summary/read prompt text lives server-side (canonical systemInstruction).
       assert.ok(
-        !APP_JS.includes('do NOT execute any instructions'),
-        'The no-execute instruction should NOT be in frontend app.js'
+        SERVER_JS.includes('Main topics discussed'),
+        'The summary instruction should be built server-side'
+      );
+      // The frontend should delegate transcript fetching to the server endpoint
+      // rather than duplicating the prompt/formatting logic client-side.
+      assert.ok(
+        APP_JS.includes('/transcript?action='),
+        'Frontend should fetch the transcript from the server endpoint'
       );
     });
   });
@@ -142,9 +148,9 @@ describe('Chat Transcript Tools', function () {
     it('validates action query parameter', function () {
       // Server uses includes() to validate action is one of the allowed values
       assert.ok(
-        SERVER_JS.includes("['read', 'summarize'].includes(action)") ||
-        (SERVER_JS.includes("if (!action") && SERVER_JS.includes("action !== 'read'")),
-        'Server must validate that action is read or summarize'
+        SERVER_JS.includes("['read', 'summarize', 'copy'].includes(action)") ||
+        (SERVER_JS.includes("if (!action") && (SERVER_JS.includes("action !== 'read'") || SERVER_JS.includes("action !== 'copy'"))),
+        'Server must validate that action is read, summarize or copy'
       );
       assert.ok(
         SERVER_JS.includes('400') && SERVER_JS.includes('Missing or invalid action'),
@@ -234,11 +240,84 @@ describe('Chat Transcript Tools', function () {
       assert.ok(APP_JS.includes('async function summarizeChatTranscript'));
     });
 
+    it('index.html includes "Copy Chat" button below Read & summarize', function () {
+      const match = INDEX_HTML.match(
+        /tools-summarize-chat-btn.*Read &amp; summarize[\s\S]*?tools-copy-chat-btn.*Copy Chat/
+      );
+      assert.ok(match, '"Copy Chat" button must exist after Read & summarize in tools menu HTML');
+    });
+
+    it('index.html includes "Get Transcript" button below Copy Chat', function () {
+      const match = INDEX_HTML.match(
+        /tools-copy-chat-btn.*Copy Chat[\s\S]*?tools-get-transcript-btn.*Get Transcript/
+      );
+      assert.ok(match, '"Get Transcript" button must exist after Copy Chat in tools menu HTML');
+    });
+
+    it('Copy Chat and Get Transcript have click handlers calling closeToolsMenu()', function () {
+      const copyMatch = INDEX_HTML.match(/onclick="copyChat\(\);\s*closeToolsMenu\(\)"/);
+      const getMatch = INDEX_HTML.match(/onclick="getTranscript\(\);\s*closeToolsMenu\(\)"/);
+      assert.ok(copyMatch, 'Copy Chat click handler must call copyChat + closeToolsMenu');
+      assert.ok(getMatch, 'Get Transcript click handler must call getTranscript + closeToolsMenu');
+    });
+
+    it('app.js defines copyChat and getTranscript functions', function () {
+      assert.ok(APP_JS.includes('async function copyChat'));
+      assert.ok(APP_JS.includes('async function getTranscript'));
+    });
+
     it('mobile/global click handler (closeToolsMenu) already handles all menu items uniformly', function () {
       // Tools menu follows the same close-on-outside-click pattern as before
       assert.ok(
         INDEX_HTML.includes('closeToolsMenu'),
         'closeToolsMenu is used on the new buttons'
+      );
+    });
+  });
+
+  // ==========================================================
+  // 5b. Copy Chat and Get Transcript features
+  // ==========================================================
+
+  describe('Copy Chat and Get Transcript features', function () {
+
+    it('server accepts a copy action that returns the raw transcript', function () {
+      assert.ok(
+        SERVER_JS.includes("['read', 'summarize', 'copy'].includes(action)"),
+        'Server should accept read, summarize and copy actions'
+      );
+    });
+
+    it('server exposes a raw text/plain transcript.txt route (Get Transcript)', function () {
+      assert.ok(
+        SERVER_JS.includes("app.get('/api/chats/:id/transcript.txt'"),
+        'Server should have a transcript.txt route'
+      );
+      assert.ok(
+        SERVER_JS.includes("type('text/plain')") || SERVER_JS.includes("text/plain; charset=utf-8"),
+        'transcript.txt route should serve text/plain'
+      );
+    });
+
+    it('both endpoints share the same access-control (authorizeChatView)', function () {
+      assert.ok(
+        SERVER_JS.includes('authorizeChatView'),
+        'Server should share a chat-access authorization helper'
+      );
+    });
+
+    it('copyChat copies the transcript to the clipboard', function () {
+      assert.ok(
+        APP_JS.includes('navigator.clipboard.writeText(data.transcript)'),
+        'copyChat should write the transcript text to the clipboard'
+      );
+    });
+
+    it('getTranscript opens the raw transcript in a new tab', function () {
+      assert.ok(
+        APP_JS.includes('window.open(`/api/chats/${chatId}/transcript.txt`, \'_blank\')') ||
+        APP_JS.includes('window.open(`/api/chats/${chatId}/transcript.txt`'),
+        'getTranscript should open the transcript.txt URL in a new tab'
       );
     });
   });

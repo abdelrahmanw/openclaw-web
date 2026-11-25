@@ -236,11 +236,15 @@ function getSession(sid) {
 const app = express();
 const PORT = 8080;
 const UPLOAD_DIR = '/tmp/openclaw-web-uploads';
+// Generated artifacts live outside /tmp so they survive tmp reaping and are
+// addressable under /p/<projectId>/artifacts/. Added 2026-11-25.
+const ARTIFACT_DIR = path.join(__dirname, 'artifacts');
 // Workspace-accessible inbound dir so the agent can read attached images/files
 // (the agent's image/read tools reject paths outside its allowed directories, e.g. /tmp).
 const AGENT_INBOUND_DIR = path.join(__dirname, '..', 'workspace', 'uploads');
 
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+if (!fs.existsSync(ARTIFACT_DIR)) fs.mkdirSync(ARTIFACT_DIR, { recursive: true });
 if (!fs.existsSync(AGENT_INBOUND_DIR)) fs.mkdirSync(AGENT_INBOUND_DIR, { recursive: true });
 
 // --- Middleware ---
@@ -923,7 +927,7 @@ app.post('/api/chats/:id/send-voice-reply', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-const OPENCLAW_BIN = '/usr/bin/openclaw';
+const OPENCLAW_BIN = process.env.OPENCLAW_BIN || '/data/.npm-global/bin/openclaw';
 
 // Streaming agent run via the persistent gateway WebSocket (chat.send + event
 // relay). The gateway streams cumulative tool/plan/assistant events, which we
@@ -2923,6 +2927,212 @@ app.get('/oauth2callback', async (req, res) => {
 // --- Facts page ---
 app.get('/facts', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'facts.html'));
+});
+
+// ============================================================
+// ARTIFACTS — generated deliverables per project
+//   GET  /p/:projectId/artifacts              -> index page
+//   GET  /p/:projectId/artifacts/:artifactId  -> render/download artifact
+//   GET  /api/projects/:id/artifacts          -> list (JSON)
+//   POST /api/projects/:id/artifacts          -> register a file already on disk
+//   DEL  /api/projects/:id/artifacts/:artifact  -> remove
+// Added 2026-11-25.
+// ============================================================
+
+// Can this session view this project's artifacts?
+async function canViewProject(req, projectId) {
+  const role = getSessionRole(req);
+  if (!role) return false;
+  if (role === 'admin' || role === 'accord') return true;
+  if (role === 'guest' && req.session.userId) {
+    const row = await db.get_(
+      'SELECT 1 AS ok FROM project_access WHERE project_id = ? AND user_id = ?',
+      [projectId, req.session.userId]
+    );
+    return !!row;
+  }
+  return false;
+}
+
+const ARTIFACT_EXT_MIME = {
+  '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
+  '.pdf': 'application/pdf', '.md': 'text/markdown; charset=utf-8',
+  '.csv': 'text/csv; charset=utf-8', '.json': 'application/json; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg', '.svg': 'image/svg+xml', '.webp': 'image/webp',
+};
+
+// Resolve a stored path and refuse anything outside the artifacts dir.
+function safeArtifactPath(storedPath) {
+  const resolved = path.resolve(storedPath);
+  const root = path.resolve(ARTIFACT_DIR);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) return null;
+  return resolved;
+}
+
+const escHtml = (s) => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;');
+
+function humanSize(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
+
+function fmtDate(ms) {
+  try {
+    return new Date(Number(ms)).toLocaleString('en-GB', {
+      day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+      timeZone: 'Europe/Berlin',
+    });
+  } catch { return ''; }
+}
+
+app.get('/p/:projectId/artifacts', async (req, res) => {
+  try {
+    const project = await db.get_('SELECT * FROM projects WHERE id = ?', [req.params.projectId]);
+    if (!project) return res.status(404).send('Project not found');
+    if (!(await canViewProject(req, project.id))) {
+      return res.status(401).send('Unauthorized — sign in to view this project\'s artifacts.');
+    }
+    const rows = await db.all_(
+      'SELECT * FROM project_artifacts WHERE project_id = ? ORDER BY created_at DESC',
+      [project.id]
+    );
+    const items = rows.map((r) => `
+      <li class="item">
+        <div class="meta">
+          <a class="name" href="/p/${encodeURIComponent(project.id)}/artifacts/${encodeURIComponent(r.id)}${/\.html?$/i.test(r.name) ? '' : '?download=1'}" ${/\.html?$/i.test(r.name) ? 'target="_blank" rel="noopener"' : ''}>
+            ${escHtml(r.title || r.name)}
+          </a>
+          <div class="sub">
+            ${escHtml(r.name)} &middot; ${humanSize(r.size)} &middot; ${escHtml(fmtDate(r.created_at))}
+            ${r.chat_id ? ` &middot; <a class="chat" href="/p/${encodeURIComponent(project.id)}/chat/${encodeURIComponent(r.chat_id)}">from chat</a>` : ''}
+          </div>
+        </div>
+      </li>`).join('');
+    res.type('html').send(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escHtml(project.name)} — Artifacts</title>
+<style>
+:root{--ink:#111827;--mid:#6b7280;--line:#e5e7eb;--soft:#f9fafb;--accent:#4f46e5}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+background:var(--soft);color:var(--ink);line-height:1.6;font-size:15px}
+.wrap{max-width:760px;margin:0 auto;padding:56px 24px 96px}
+h1{font-size:26px;margin:0 0 4px;letter-spacing:-.4px}
+.subtitle{color:var(--mid);font-size:14px;margin:0 0 28px}
+ul{list-style:none;padding:0;margin:0}
+.item{background:#fff;border:1px solid var(--line);border-radius:12px;padding:16px 20px;margin-bottom:12px}
+.name{font-weight:600;color:var(--accent);text-decoration:none;font-size:15px}
+.name:hover{text-decoration:underline}
+.sub{color:var(--mid);font-size:13px;margin-top:5px}
+.chat{color:var(--mid)}
+.empty{background:#fff;border:1px solid var(--line);border-radius:12px;padding:28px;color:var(--mid);text-align:center}
+</style></head><body><div class="wrap">
+<h1>${escHtml(project.name)}</h1>
+<p class="subtitle">Artifacts${rows.length ? ` &middot; ${rows.length}` : ''}</p>
+${rows.length ? `<ul>${items}</ul>` : '<div class="empty">No artifacts yet.</div>'}
+</div></body></html>`);
+  } catch (e) { res.status(500).send('Error: ' + escHtml(e.message)); }
+});
+
+app.get('/p/:projectId/artifacts/:artifactId', async (req, res) => {
+  try {
+    const project = await db.get_('SELECT * FROM projects WHERE id = ?', [req.params.projectId]);
+    if (!project) return res.status(404).send('Project not found');
+    if (!(await canViewProject(req, project.id))) {
+      return res.status(401).send('Unauthorized — sign in to view this artifact.');
+    }
+    const art = await db.get_(
+      'SELECT * FROM project_artifacts WHERE id = ? AND project_id = ?',
+      [req.params.artifactId, project.id]
+    );
+    if (!art) return res.status(404).send('Artifact not found');
+    const filePath = safeArtifactPath(art.path);
+    if (!filePath || !fs.existsSync(filePath)) return res.status(404).send('Artifact file missing on disk');
+    const ext = path.extname(art.name || '').toLowerCase();
+    const mime = ARTIFACT_EXT_MIME[ext] || art.mimetype || 'application/octet-stream';
+    const inline = req.query.download ? false : (mime.startsWith('text/html') || mime.startsWith('image/') || mime.startsWith('application/pdf'));
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Content-Disposition',
+      `${inline ? 'inline' : 'attachment'}; filename="${(art.name || 'artifact').replace(/"/g, '')}"`);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    // Artifacts are static documents; allow framing only from same origin.
+    res.setHeader('Content-Security-Policy', "frame-ancestors 'self'");
+    fs.createReadStream(filePath).pipe(res);
+  } catch (e) { res.status(500).send('Error: ' + escHtml(e.message)); }
+});
+
+app.get('/api/projects/:id/artifacts', requireAuth, async (req, res) => {
+  try {
+    if (!(await canViewProject(req, req.params.id))) return res.status(403).json({ error: 'Forbidden' });
+    res.json(await db.all_(
+      'SELECT * FROM project_artifacts WHERE project_id = ? ORDER BY created_at DESC',
+      [req.params.id]
+    ));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Register an artifact. Accepts either { sourcePath } (file already on disk, copied in)
+// or { contentBase64 } (inline payload). Keeps the browser/agent out of the DB.
+app.post('/api/projects/:id/artifacts', requireAuth, async (req, res) => {
+  try {
+    const project = await db.get_('SELECT id FROM projects WHERE id = ?', [req.params.id]);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    const { name, title, chatId, sourcePath, contentBase64 } = req.body || {};
+    const safeName = String(name || '').replace(/[^A-Za-z0-9._-]/g, '');
+    if (!safeName) return res.status(400).json({ error: 'Invalid or missing name' });
+
+    const id = uuidv4();
+    const projectDir = path.join(ARTIFACT_DIR, String(project.id).replace(/[^A-Za-z0-9_-]/g, ''));
+    fs.mkdirSync(projectDir, { recursive: true });
+    const destPath = path.join(projectDir, `${id}__${safeName}`);
+
+    let size = 0;
+    if (contentBase64) {
+      const buf = Buffer.from(String(contentBase64), 'base64');
+      fs.writeFileSync(destPath, buf);
+      size = buf.length;
+    } else if (sourcePath) {
+      const src = path.resolve(String(sourcePath));
+      if (!fs.existsSync(src)) return res.status(400).json({ error: 'sourcePath not found' });
+      const st = fs.statSync(src);
+      if (!st.isFile()) return res.status(400).json({ error: 'sourcePath is not a file' });
+      if (st.size > 50 * 1024 * 1024) return res.status(413).json({ error: 'Artifact larger than 50 MB' });
+      fs.copyFileSync(src, destPath);
+      size = st.size;
+    } else {
+      return res.status(400).json({ error: 'Provide sourcePath or contentBase64' });
+    }
+
+    const mimetype = ARTIFACT_EXT_MIME[path.extname(safeName).toLowerCase()] || 'application/octet-stream';
+    await db.run_(
+      'INSERT INTO project_artifacts (id, project_id, chat_id, name, title, path, size, mimetype, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [id, project.id, chatId || null, safeName, title || '', destPath, size, mimetype, Date.now()]
+    );
+    res.json({
+      id, name: safeName, title: title || '', size, mimetype,
+      url: `/p/${project.id}/artifacts/${id}`,
+      listUrl: `/p/${project.id}/artifacts`,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/projects/:id/artifacts/:artifactId', requireAuth, async (req, res) => {
+  try {
+    const art = await db.get_(
+      'SELECT * FROM project_artifacts WHERE id = ? AND project_id = ?',
+      [req.params.artifactId, req.params.id]
+    );
+    if (!art) return res.status(404).json({ error: 'Artifact not found' });
+    const filePath = safeArtifactPath(art.path);
+    if (filePath) { try { fs.unlinkSync(filePath); } catch {} }
+    await db.run_('DELETE FROM project_artifacts WHERE id = ?', [art.id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // --- SPA catch-all: serve index.html for any non-API, non-share, non-static path ---

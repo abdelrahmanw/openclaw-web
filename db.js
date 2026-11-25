@@ -81,6 +81,21 @@ db.serialize(() => {
   )`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_project_links_project_id ON project_links(project_id)`);
 
+  // Artifacts: generated deliverables (reports, pages, exports) owned by a project,
+  // attributed to the chat that produced them. Added 2026-11-25.
+  db.run(`CREATE TABLE IF NOT EXISTS project_artifacts (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    chat_id TEXT,
+    name TEXT NOT NULL,
+    title TEXT DEFAULT '',
+    path TEXT NOT NULL,
+    size INTEGER DEFAULT 0,
+    mimetype TEXT DEFAULT 'text/html',
+    created_at INTEGER NOT NULL
+  )`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_project_artifacts_project_id ON project_artifacts(project_id)`);
+
   // Phase 3 migrations
   db.run(`ALTER TABLE messages ADD COLUMN user_id TEXT`, (e) => { if (e && !e.message.includes('duplicate')) console.error('alter messages.user_id:', e.message); });
   db.run(`ALTER TABLE messages ADD COLUMN display_name TEXT`, (e) => { if (e && !e.message.includes('duplicate')) console.error('alter messages.display_name:', e.message); });

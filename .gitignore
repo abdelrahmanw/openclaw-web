@@ -7,3 +7,11 @@ certs/
 /tmp/openclaw-web-uploads/
 .env
 *.log
+
+# secrets & local state
+google-creds.json
+google-token.json
+_send_invite.js
+*.bak
+*.bak-*
+artifacts/

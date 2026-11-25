@@ -2,7 +2,8 @@
  * gateway-client.js
  * Reusable OpenClaw Gateway WebSocket client.
  * Handles auth handshake and exposes request/subscribe helpers.
- * v2: Supports caps, reconnection, and shared persistent connection.
+ * v3: Device-identity optional. Works on OpenClaw <=2026.7 (JSON identity files)
+ *     and >=2026.9 (identity moved into the state DB) without code changes.
  */
 
 const path = require('path');
@@ -16,9 +17,11 @@ const WS = (() => {
 })();
 
 const HOME = process.env.HOME || '/home/clawdbot';
-const OPENCLAW_JSON  = path.join(HOME, '.openclaw', 'openclaw.json');
-const DEVICE_JSON    = path.join(HOME, '.openclaw', 'identity', 'device.json');
-const DEVICE_AUTH_JSON = path.join(HOME, '.openclaw', 'identity', 'device-auth.json');
+const STATE_DIR      = path.join(HOME, '.openclaw');
+const OPENCLAW_JSON  = path.join(STATE_DIR, 'openclaw.json');
+const DEVICE_JSON    = path.join(STATE_DIR, 'identity', 'device.json');
+const DEVICE_AUTH_JSON = path.join(STATE_DIR, 'identity', 'device-auth.json');
+const STATE_DB       = path.join(STATE_DIR, 'state', 'openclaw.sqlite');
 const GATEWAY_WS    = 'ws://127.0.0.1:18789/';
 
 const SCOPES = [
@@ -53,6 +56,86 @@ function publicKeyRawBase64Url(pem) {
 }
 
 /**
+ * Read the gateway token. Prefers openclaw.json, falls back to the
+ * device-auth.json operator token (legacy layouts).
+ */
+function readGatewayTokens() {
+  let configToken = null;
+  try {
+    const config = JSON.parse(fs.readFileSync(OPENCLAW_JSON, 'utf8'));
+    configToken = config?.gateway?.auth?.token || config?.gateway?.remote?.token || null;
+  } catch (_) {}
+
+  let deviceToken = null;
+  try {
+    const deviceAuth = JSON.parse(fs.readFileSync(DEVICE_AUTH_JSON, 'utf8'));
+    deviceToken = deviceAuth?.tokens?.operator?.token || null;
+  } catch (_) {}
+
+  return {
+    // Authorization header token — the config token is the gateway-wide credential.
+    headerToken: configToken || deviceToken,
+    // Payload/device token — legacy device-auth token wins if present.
+    authToken: deviceToken || configToken,
+  };
+}
+
+/**
+ * Best-effort read of a device identity from the state DB (OpenClaw >= 2026.9).
+ * Returns null when unavailable — never throws.
+ */
+function readIdentityFromDb() {
+  let db = null;
+  try {
+    if (!fs.existsSync(STATE_DB)) return null;
+    const Database = require('better-sqlite3');
+    db = new Database(STATE_DB, { readonly: true, fileMustExist: true });
+    const row = db
+      .prepare('SELECT device_id, public_key_pem, private_key_pem FROM device_identities ORDER BY updated_at_ms DESC LIMIT 1')
+      .get();
+    if (!row || !row.private_key_pem || !row.device_id) return null;
+    return {
+      deviceId: row.device_id,
+      publicKeyPem: row.public_key_pem,
+      privateKeyPem: row.private_key_pem,
+      source: 'db',
+    };
+  } catch (_) {
+    return null;
+  } finally {
+    try { if (db) db.close(); } catch {}
+  }
+}
+
+/**
+ * Read the device identity from the legacy JSON file (OpenClaw <= 2026.7).
+ * Returns null when the file is gone — never throws.
+ */
+function readIdentityFromFile() {
+  try {
+    const device = JSON.parse(fs.readFileSync(DEVICE_JSON, 'utf8'));
+    if (!device?.deviceId || !device?.privateKeyPem) return null;
+    return {
+      deviceId: device.deviceId,
+      publicKeyPem: device.publicKeyPem,
+      privateKeyPem: device.privateKeyPem,
+      source: 'file',
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Resolve a usable device identity, or null when we should use the
+ * token-only local connect path. Never throws.
+ */
+function resolveDeviceIdentity() {
+  if (String(process.env.OPENCLAW_GW_NO_DEVICE || '') === '1') return null;
+  return readIdentityFromFile() || readIdentityFromDb();
+}
+
+/**
  * Create an authenticated gateway connection.
  * Returns a client object with:
  *   - request(method, params) → Promise<payload>
@@ -60,24 +143,34 @@ function publicKeyRawBase64Url(pem) {
  *   - close()
  *   - ready                  — Promise that resolves when connected+authed
  *   - generation             — monotonic connection id (increments on each connect)
+ *   - authMode               — 'device' | 'token'
+ *
+ * Throws synchronously only for unrecoverable config problems (no token at all).
  */
 function createGatewayClient(opts = {}) {
-  const config = JSON.parse(fs.readFileSync(OPENCLAW_JSON, 'utf8'));
-  const WS_TOKEN = config.gateway?.auth?.token;
-  let DEVICE_TOKEN = WS_TOKEN;
-  try {
-    const deviceAuth = JSON.parse(fs.readFileSync(DEVICE_AUTH_JSON, 'utf8'));
-    DEVICE_TOKEN = deviceAuth?.tokens?.operator?.token || WS_TOKEN;
-  } catch (_) {}
-  const TOKEN = DEVICE_TOKEN;
-  const device = JSON.parse(fs.readFileSync(DEVICE_JSON, 'utf8'));
+  const { headerToken, authToken } = readGatewayTokens();
+  if (!headerToken) {
+    throw new Error('gateway token unavailable (openclaw.json gateway.auth.token missing)');
+  }
+  const TOKEN = authToken || headerToken;
+
+  // Optional: device identity. Absent on OpenClaw >= 2026.9 after migration.
+  const device = opts.device === null ? null : resolveDeviceIdentity();
+  const authMode = device ? 'device' : 'token';
+
+  // When we have no signing key we connect as a trusted same-process backend
+  // client. That is the documented device-less loopback path (docs/gateway/
+  // protocol.md): it only accepts the shared gateway token as auth.token.
+  const CLIENT = device
+    ? { id: 'cli', version: '2026.5.28', platform: 'linux', mode: 'cli' }
+    : { id: 'gateway-client', version: '2026.10.6', platform: 'linux', mode: 'backend' };
 
   const generation = ++connectionGeneration;
 
   // Extract caps. Caps make the Gateway send extra events during agent runs.
   const caps = opts.caps || [];
 
-  const ws = new WS(GATEWAY_WS, { headers: { Authorization: `Bearer ${WS_TOKEN}` } });
+  const ws = new WS(GATEWAY_WS, { headers: { Authorization: `Bearer ${headerToken}` } });
 
   let reqId = 0;
   const pending  = new Map();
@@ -126,23 +219,31 @@ function createGatewayClient(opts = {}) {
       clearTimeout(timeout);
       const nonce = frame.payload?.nonce;
       const signedAtMs = Date.now();
-      const payloadStr = buildAuthPayload({ deviceId: device.deviceId, token: TOKEN, nonce, signedAtMs });
-      const signature  = signPayload(device.privateKeyPem, payloadStr);
+
+      const connectParams = {
+        minProtocol: 4, maxProtocol: 4,
+        client: CLIENT,
+        caps: caps.length > 0 ? caps : void 0,
+        auth: { token: device ? TOKEN : headerToken },
+        scopes: SCOPES, role: 'operator',
+      };
+
+      if (device) {
+        const payloadStr = buildAuthPayload({ deviceId: device.deviceId, token: TOKEN, nonce, signedAtMs });
+        const signature  = signPayload(device.privateKeyPem, payloadStr);
+        connectParams.device = {
+          id: device.deviceId,
+          publicKey: publicKeyRawBase64Url(device.publicKeyPem),
+          signature, signedAt: signedAtMs, nonce,
+        };
+      }
+
       try {
-        await _request('connect', {
-          minProtocol: 4, maxProtocol: 4,
-          client: { id: 'cli', version: '2026.5.28', platform: 'linux', mode: 'cli' },
-          caps: caps.length > 0 ? caps : void 0,
-          auth: { token: TOKEN },
-          scopes: SCOPES, role: 'operator',
-          device: {
-            id: device.deviceId,
-            publicKey: publicKeyRawBase64Url(device.publicKeyPem),
-            signature, signedAt: signedAtMs, nonce,
-          },
-        });
+        await _request('connect', connectParams);
         resolveReady();
-      } catch (e) { rejectReady(e); }
+      } catch (e) {
+        rejectReady(e);
+      }
       return;
     }
 
@@ -171,6 +272,8 @@ function createGatewayClient(opts = {}) {
     _ws: ws,
     ready,
     generation,
+    authMode,
+    deviceSource: device ? device.source : null,
     get connected() { return !_closed && ws.readyState === 1; },
     async request(method, params) {
       await ready;
